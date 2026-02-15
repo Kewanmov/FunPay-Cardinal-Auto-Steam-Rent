@@ -62,7 +62,7 @@ from tg_bot import CBT as _CBT
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
 NAME = "Auto Steam Rent"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CREDITS = "@kewanmov"
 DESCRIPTION = "Плагин для автоматической аренды Steam аккаунтов на площадке FunPay"
 UUID = "b8b118dd-be5d-4697-b50e-f5f8f2e2043e"
@@ -487,22 +487,39 @@ class SteamPasswordChanger:
                f"?s={params.get('s', 0)}&account={params.get('account', 0)}"
                f"&reset={params.get('reset', 0)}&lost={params.get('lost', 0)}"
                f"&issueid={params.get('issueid', 0)}")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-setuid-sandbox",
-                                     "--disable-dev-shm-usage", "--disable-gpu"])
-            ctx = await browser.new_context(user_agent=self.UA, locale="en-US",
-                                            viewport={"width": 1280, "height": 720})
-            if cookies_for_pw:
-                await ctx.add_cookies(cookies_for_pw)
-            page = await ctx.new_page()
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(5)
-            except Exception:
-                pass
-            finally:
-                await browser.close()
+        browser = None
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True, args=["--no-sandbox", "--disable-setuid-sandbox",
+                                         "--disable-dev-shm-usage", "--disable-gpu",
+                                         "--single-process", "--no-zygote"])
+                ctx = await browser.new_context(user_agent=self.UA, locale="en-US",
+                                                viewport={"width": 1280, "height": 720})
+                if cookies_for_pw:
+                    await ctx.add_cookies(cookies_for_pw)
+                page = await ctx.new_page()
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=30000)
+                    await asyncio.sleep(5)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Playwright trigger confirmation error: {e}")
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     async def _get_confirmations_with_session(self, session: aiohttp.ClientSession) -> list:
         await SteamGuard.sync_time_async()
@@ -614,11 +631,38 @@ async def change_password_async(mafile: dict, current_password: str) -> str:
 
 
 def change_password_sync(mafile: dict, current_password: str) -> str:
-    loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(change_password_async(mafile, current_password))
-    finally:
-        loop.close()
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        new_loop = asyncio.new_event_loop()
+        result = [None]
+        error = [None]
+
+        def _run():
+            try:
+                result[0] = new_loop.run_until_complete(change_password_async(mafile, current_password))
+            except Exception as e:
+                error[0] = e
+            finally:
+                new_loop.close()
+
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=180)
+        if error[0]:
+            raise error[0]
+        if result[0] is None:
+            raise Exception("Password change timed out")
+        return result[0]
+    else:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(change_password_async(mafile, current_password))
+        finally:
+            loop.close()
 
 
 class LotConfig(BaseModel):
@@ -1077,12 +1121,6 @@ class TgLogs:
         if SETTINGS.notification_refund:
             self._send(f"💰 Возврат #{order_id[:12]}...\n∟ Причина: {reason}")
 
-    def lot_debug(self, order_id, description, lot_id, found):
-        self._send(f"🔍 Поиск лота для #{order_id[:8]}...\n"
-                   f"∟ Описание: <code>{description[:80]}</code>\n"
-                   f"∟ Найден lot_id: <code>{lot_id}</code>\n"
-                   f"∟ В конфиге: {'✅' if found else '❌'}")
-
 
 def _tmpl(template: str, **kw) -> str:
     r = template
@@ -1132,17 +1170,15 @@ def _resolve_lot_id(c, order) -> Optional[str]:
         if val:
             lid = str(val)
             if SETTINGS.get_lot(lid):
-                logger.info(f"Order {order_id}: direct lot_id={lid} from order.{attr}, found in config")
+                logger.info(f"Order {order_id}: direct lot_id={lid} found in config")
                 return lid
-            else:
-                logger.debug(f"Order {order_id}: direct lot_id={lid} from order.{attr}, NOT in config")
 
     for attr in ('lot', 'offer', 'item'):
         obj = getattr(order, attr, None)
         if obj and hasattr(obj, 'id') and obj.id:
             lid = str(obj.id)
             if SETTINGS.get_lot(lid):
-                logger.info(f"Order {order_id}: lot_id={lid} from order.{attr}.id, found in config")
+                logger.info(f"Order {order_id}: lot_id={lid} from {attr}.id found in config")
                 return lid
 
     description = ""
@@ -1153,15 +1189,12 @@ def _resolve_lot_id(c, order) -> Optional[str]:
             break
 
     if not description:
-        logger.warning(f"Order {order_id}: no description, cannot resolve lot")
+        logger.debug(f"Order {order_id}: no description, skipping")
         return None
-
-    logger.debug(f"Order {order_id}: resolving by description='{description}'")
 
     try:
         title_to_id = _build_lot_id_index(c)
         if not title_to_id:
-            logger.warning(f"Order {order_id}: no lots found on profile")
             return None
 
         matched_lid = title_to_id.get(description)
@@ -1171,11 +1204,10 @@ def _resolve_lot_id(c, order) -> Optional[str]:
                 logger.info(f"Order {order_id}: exact title match -> lot_id={lid}")
                 return lid
             else:
-                logger.info(f"Order {order_id}: exact title match -> lot_id={lid}, but NOT in config, skipping")
+                logger.debug(f"Order {order_id}: title matched lot_id={lid} but not in config")
                 return None
 
-        logger.info(f"Order {order_id}: no exact match for '{description[:60]}' among {len(title_to_id)} lots. "
-                    f"Configured: {list(SETTINGS.lots.keys())}")
+        logger.debug(f"Order {order_id}: no exact match for '{description[:50]}', not our lot")
         return None
 
     except Exception as e:
@@ -1192,14 +1224,15 @@ def _recover_account(c, acc, order, reason):
             if reason == "TIME" and order.chat_id:
                 _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.rent_over, id=order.id))
     except Exception as e:
+        logger.error(f"Password change failed for {acc.login}: {e}")
         AccountRepo.release(acc.id, error=True)
         if tg_logs:
-            tg_logs.error(f"Смена пароля: {acc.login} - {str(e)[:50]}")
+            tg_logs.error(f"Смена пароля: {acc.login} - {str(e)[:80]}")
         if SETTINGS.autoback_on_error and order:
             if _do_refund(c, order.id):
                 order.update(status=RentStatus.REFUND)
             if tg_logs:
-                tg_logs.refund(order.id, f"Ошибка: {acc.login}")
+                tg_logs.refund(order.id, f"Ошибка смены пароля: {acc.login}")
 
 
 def process_new_order(c, event):
@@ -1214,34 +1247,22 @@ def process_new_order(c, event):
         return
 
     if order_id in _processed_orders:
-        logger.debug(f"Order {order_id} already processed, skipping")
         return
     _processed_orders.add(order_id)
 
     if order_id in ORDERS:
-        logger.debug(f"Order {order_id} already in ORDERS, skipping")
         return
 
     lot_id = _resolve_lot_id(c, order)
 
-    description = getattr(order, 'description', None) or getattr(order, 'title', None) or ""
-
     if not lot_id:
-        logger.info(f"Order {order_id}: lot not found or not in config, description='{description[:60]}', ignoring")
-        if tg_logs:
-            tg_logs.lot_debug(order_id, description, "не найден", False)
         return
 
     lot_cfg = SETTINGS.get_lot(lot_id)
     if not lot_cfg:
-        logger.info(f"Order {order_id}: lot_id={lot_id} not in config, ignoring")
-        if tg_logs:
-            tg_logs.lot_debug(order_id, description, lot_id, False)
         return
 
     logger.info(f"Order {order_id}: lot_id={lot_id}, tag={lot_cfg.tag}, hours={lot_cfg.hours}")
-    if tg_logs:
-        tg_logs.lot_debug(order_id, description, lot_id, True)
 
     tag, hours = _ntag(lot_cfg.tag), lot_cfg.hours
     if hours <= 0:
