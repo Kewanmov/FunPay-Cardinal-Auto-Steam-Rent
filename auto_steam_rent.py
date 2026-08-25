@@ -27,7 +27,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 for pkg, imp in [("aiohttp", "aiohttp"), ("pytz", "pytz"), ("pysteamauth", "pysteamauth"),
                  ("rsa", "rsa"), ("requests", "requests"), ("yarl", "yarl"),
-                 ("playwright", "playwright")]:
+                 ("aiohttp-socks", "aiohttp_socks"), ("playwright", "playwright")]:
     try:
         importlib.import_module(imp)
     except ImportError:
@@ -38,24 +38,30 @@ for pkg, imp in [("aiohttp", "aiohttp"), ("pytz", "pytz"), ("pysteamauth", "pyst
         except Exception:
             pass
 
-try:
-    from playwright.sync_api import sync_playwright as _sync_pw
-    _pw_check_needed = False
+_chromium_ready = threading.Event()
+
+def _ensure_chromium():
     try:
-        with _sync_pw() as _p:
-            _cb = _p.chromium.executable_path
-            if not os.path.exists(_cb):
-                _pw_check_needed = True
+        from playwright.sync_api import sync_playwright as _sync_pw
+        needed = False
+        try:
+            with _sync_pw() as _p:
+                if not os.path.exists(_p.chromium.executable_path):
+                    needed = True
+        except Exception:
+            needed = True
+        if needed:
+            subprocess.check_call(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=300
+            )
     except Exception:
-        _pw_check_needed = True
-    if _pw_check_needed:
-        subprocess.check_call(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=300
-        )
-except Exception:
-    pass
+        pass
+    finally:
+        _chromium_ready.set()
+
+threading.Thread(target=_ensure_chromium, daemon=True, name="chromium-install").start()
 
 import aiohttp
 import rsa
@@ -70,7 +76,7 @@ from tg_bot import CBT as _CBT
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
 NAME = "Auto Steam Rent"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 CREDITS = "@kewanmov"
 DESCRIPTION = "Плагин для автоматической аренды Steam аккаунтов на площадке FunPay"
 UUID = "d12da53a-391f-416c-b49c-d57f697f9208"
@@ -89,16 +95,19 @@ except Exception:
 
 _PERIOD_LABELS = {
     1: "1 час", 2: "2 часа", 3: "3 часа", 6: "6 часов",
-    12: "12 часов", 24: "1 день", 48: "2 дня", 72: "3 дня", 168: "7 дней"
+    12: "12 часов", 24: "24 часа", 48: "2 дня", 72: "3 дня", 168: "7 дней"
 }
 
 ALL_PERIODS: List[int] = list(_PERIOD_LABELS)
 
 ICON_STATUS = {"FREE": "🟢", "ACTIVE": "👤", "BUSY": "⏳", "ERROR": "❌"}
+STATUS_LABELS = {"FREE": "Свободен", "ACTIVE": "Арендован", "BUSY": "Занят", "ERROR": "Ошибка"}
 
 CODE_COOLDOWN = 5.0
 
-PASSWORD_CHANGE_TIMEOUT = 180
+PASSWORD_CHANGE_TIMEOUT = 240
+
+REQUEST_TIMEOUT = 45
 
 class SteamEmailVerificationRequired(Exception):
     pass
@@ -118,8 +127,26 @@ def _safe_err(e: Exception) -> str:
     text = _html.escape(text)
     return text[:300]
 
+def _pwd_error_hint(e: Exception) -> str:
+    err_str = str(e).lower()
+    if "invalidpassword" in err_str or "неверный пароль" in err_str or "неверен" in err_str:
+        return "Пароль в боте не совпадает с реальным — обновите пароль аккаунта вручную в меню"
+    if "confirmation" in err_str or "mobile" in err_str:
+        return ("Подтверждение в Steam не появилось. Проверьте: установлен ли Chromium "
+                "(он нужен для смены пароля), верный ли device_id в maFile, не заблокирован ли аккаунт")
+    if "timeout" in err_str or "timed out" in err_str:
+        return "Steam не ответил вовремя (недоступен или перегружен) — повторите позже"
+    if "email" in err_str:
+        return "Steam просит подтверждение по почте — войдите в аккаунт через Steam и подтвердите письмо"
+    return "Запустите смену пароля ещё раз; если повторяется — обратитесь за помощью с логом ошибки"
+
 def _period_label(h: int) -> str:
-    return _PERIOD_LABELS.get(h, f"{h}ч")
+    if h in _PERIOD_LABELS:
+        return _PERIOD_LABELS[h]
+    if h % 24 == 0:
+        days = h // 24
+        return f"{days} дн."
+    return f"{h}ч"
 
 def _format_periods(hours: List[int]) -> str:
     return ", ".join(_period_label(h) for h in sorted(hours))
@@ -137,9 +164,6 @@ def _parse(s: str) -> datetime:
         return MOSCOW_TZ.localize(datetime.strptime(s, _DT_FMT))
     except Exception:
         return _now()
-
-def _ntag(tag: str) -> str:
-    return tag.strip().lower()
 
 def _extract_lot_id(text: str) -> Optional[str]:
     if not text:
@@ -197,6 +221,8 @@ def _load_json(filename: str) -> Any:
 _file_lock = threading.Lock()
 
 def _save_json(filename: str, data: Any):
+    if _stop_event.is_set():
+        return
     p = _get_path(filename)
     with _file_lock:
         dir_name = os.path.dirname(p)
@@ -243,31 +269,59 @@ def _invalidate_lots_cache():
     _lots_cache.data.clear()
     _lots_cache.updated_at = None
 
-def _toggle_fp_lots_for_tag(c, tag: str, enable: bool) -> List[str]:
-    tag = _ntag(tag)
+def _lots_for_account(account_id: int) -> List[str]:
+    return [lid for lid in SETTINGS.lots
+            if account_id in (SETTINGS.get_lot(lid) or LotConfig(hours=24)).account_ids]
+
+def _lot_has_free_account(lot_id: str) -> bool:
+    lc = SETTINGS.get_lot(lot_id)
+    if not lc or not lc.account_ids:
+        return False
+    return any(AccountRepo.is_free(aid) for aid in lc.account_ids)
+
+def _set_fp_lots_active(c, lot_ids: List[str], enable: bool) -> List[str]:
+    toggled = []
+    for lid in lot_ids:
+        try:
+            lf = c.account.get_lot_fields(int(lid))
+            if lf.active == enable:
+                continue
+            lf.active = enable
+            c.account.save_lot(lf)
+            lf2 = c.account.get_lot_fields(int(lid))
+            if lf2.active == enable:
+                toggled.append(lid)
+                logger.debug(f"[AutoSteamRent] Лот #{lid} {'включён' if enable else 'выключен'} на FunPay ✓")
+            else:
+                logger.warning(
+                    f"[AutoSteamRent] Лот #{lid}: save_lot прошёл без ошибок, "
+                    f"но состояние на FunPay не изменилось (active={lf2.active}, ожидалось {enable}). "
+                    f"Возможно: db_amount=0, деактивация после продажи или ошибка сессии."
+                )
+        except Exception as e:
+            err_str = str(e)
+            lead = re.search(r'<p class="lead">([^<]+)</p>', err_str)
+            brief = lead.group(1).strip() if lead else err_str.split("\n")[0]
+            logger.warning(f"[AutoSteamRent] Ошибка переключения лота #{lid}: {brief}")
+    return toggled
+
+def _resync_lots_for_account(c, account_id: int) -> Tuple[List[str], List[str]]:
     with _toggling_lock:
-        if tag in _toggling_tags:
-            return []
-        _toggling_tags.add(tag)
+        if account_id in _toggling_accounts:
+            return [], []
+        _toggling_accounts.add(account_id)
     try:
-        lot_ids = [lid for lid in SETTINGS.lots
-                   if _ntag((SETTINGS.get_lot(lid) or LotConfig(tag="default", hours=24)).tag) == tag]
-        toggled = []
-        for lid in lot_ids:
-            try:
-                lf = c.account.get_lot_fields(int(lid))
-                if lf.active != enable:
-                    lf.active = enable
-                    c.account.save_lot(lf)
-                    toggled.append(lid)
-                    logger.debug(f"[AutoSteamRent] Лот #{lid} {'включён' if enable else 'выключен'} на FunPay")
-            except Exception as e:
-                logger.warning(f"[AutoSteamRent] Ошибка переключения лота #{lid}: {e}")
-        _invalidate_lots_cache()
-        return toggled
+        lot_ids = _lots_for_account(account_id)
+        to_enable = [lid for lid in lot_ids if _lot_has_free_account(lid)]
+        to_disable = [lid for lid in lot_ids if lid not in to_enable]
+        enabled = _set_fp_lots_active(c, to_enable, True) if SETTINGS.auto_enable_lots else []
+        disabled = _set_fp_lots_active(c, to_disable, False) if SETTINGS.auto_disable_lots else []
+        if enabled or disabled:
+            _invalidate_lots_cache()
+        return enabled, disabled
     finally:
         with _toggling_lock:
-            _toggling_tags.discard(tag)
+            _toggling_accounts.discard(account_id)
 
 class RentStatus:
     FREE = "FREE"
@@ -367,12 +421,13 @@ def _generate_confirmation_key(identity_secret: str, timestamp: int, tag: str) -
 
 class CustomSteam(_BaseSteam):
 
-    def __init__(self, login, password, shared_secret, identity_secret, device_id, steamid):
+    def __init__(self, login, password, shared_secret, identity_secret, device_id, steamid, proxy=None):
         super().__init__(login=login, password=password, steamid=steamid,
                          shared_secret=shared_secret, identity_secret=identity_secret,
                          device_id=device_id)
         self._login = login
         self._pwd = password
+        self._proxy = proxy
 
     @property
     def login(self):
@@ -383,6 +438,12 @@ class CustomSteam(_BaseSteam):
         return self._pwd
 
     async def raw_request(self, method: str, url: str, **kw):
+        return await asyncio.wait_for(
+            self._raw_request_impl(method, url, **kw),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    async def _raw_request_impl(self, method: str, url: str, **kw):
         from urllib3.util import parse_url
         parsed = parse_url(url)
         host = parsed.host or "steamcommunity.com"
@@ -390,6 +451,20 @@ class CustomSteam(_BaseSteam):
             cookies = await self.cookies(host)
         except Exception:
             cookies = {}
+        proxy = self._proxy or (SETTINGS.pwd_change_proxy if SETTINGS else None)
+        if proxy and "proxy" not in kw:
+            if proxy.startswith("socks"):
+                try:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(proxy, ssl=False)
+                    async with aiohttp.ClientSession(connector=connector) as _s:
+                        async with _s.request(method=method, url=url, cookies=cookies, **kw) as _r:
+                            await _r.read()
+                            return _r
+                except ImportError:
+                    logger.warning("[AutoSteamRent] aiohttp-socks не установлен, SOCKS прокси недоступен")
+            else:
+                kw["proxy"] = proxy
         return await self._requests.request(method=method, url=url, cookies=cookies, **kw)
 
 class PasswordChangeParams:
@@ -428,14 +503,55 @@ def _get_acc_lock(acc_id: int) -> threading.Lock:
             _acc_pwd_locks[acc_id] = threading.Lock()
         return _acc_pwd_locks[acc_id]
 
+async def _verify_new_password(mafile: dict, new_password: str, proxy: str = None) -> bool:
+    login = mafile.get("account_name", "")
+    try:
+        steam = CustomSteam(
+            login=login, password=new_password,
+            shared_secret=mafile.get("shared_secret", ""),
+            identity_secret=mafile.get("identity_secret", ""),
+            device_id=mafile.get("device_id", ""),
+            steamid=int((mafile.get("Session") or {}).get("SteamID", 0)),
+            proxy=proxy,
+        )
+        try:
+            await asyncio.wait_for(steam.login_to_steam(), timeout=45)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                if hasattr(steam, "_requests") and steam._requests:
+                    await steam._requests.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def _verify_new_password_sync(mafile: dict, new_password: str, proxy: str = None) -> bool:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_verify_new_password(mafile, new_password, proxy))
+    except Exception:
+        return False
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
 class SteamPasswordChanger:
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     HELP = "https://help.steampowered.com"
 
-    def __init__(self, mafile: dict, current_password: str):
+    def __init__(self, mafile: dict, current_password: str, new_password: str, proxy: str = None):
         self.mafile = mafile
         self.current_password = current_password
+        self.new_password = new_password
+        self.proxy = proxy
         self.login = mafile.get("account_name", "")
         self.shared_secret = mafile.get("shared_secret", "")
         self.identity_secret = mafile.get("identity_secret", "")
@@ -450,32 +566,57 @@ class SteamPasswordChanger:
             raise ValueError(f"Отсутствует в maFile (нужно для смены пароля): {', '.join(full_check)}")
 
     async def change_password(self) -> str:
-        new_password = _gen_password(20)
+        new_password = self.new_password
         self._steam = CustomSteam(
             login=self.login, password=self.current_password,
             shared_secret=self.shared_secret, identity_secret=self.identity_secret,
-            device_id=self.device_id, steamid=self.steamid)
-        await self._login_steam()
-        params = await self._get_wizard_params()
-        logger.info(f"[AutoSteamRent] Wizard params: s={params.s} issueid={params.issueid}")
-        await self._playwright_open_wizard(params)
-        confirmed = await self._confirm_recovery(params)
-        if not confirmed:
-            raise Exception(f"Mobile confirmation не принята для {self.login}")
-        logger.info(f"[AutoSteamRent] Мобильное подтверждение: {self.login} — OK")
-        await self._poll_recovery(params)
-        await self._verify_recovery_code(params)
-        await self._get_next_step(params)
-        key = await self._get_rsa_key()
-        enc_old = self._encrypt(self.current_password, key["publickey_mod"], key["publickey_exp"])
-        await self._verify_old_password(params, enc_old, key["timestamp"])
-        logger.info(f"[AutoSteamRent] Старый пароль подтверждён: {self.login}")
-        await self._check_password_available(new_password)
-        key2 = await self._get_rsa_key()
-        enc_new = self._encrypt(new_password, key2["publickey_mod"], key2["publickey_exp"])
-        await self._do_change_password(params, enc_new, key2["timestamp"])
-        logger.info(f"[AutoSteamRent] Пароль изменён: {self.login}")
-        return new_password
+            device_id=self.device_id, steamid=self.steamid, proxy=self.proxy)
+        try:
+            await self._login_steam()
+            params = await self._get_wizard_params()
+            logger.debug(f"[AutoSteamRent] wizard params: s={params.s} issueid={params.issueid}")
+            logger.info(f"[AutoSteamRent] Смена пароля {self.login}: параметры восстановления получены")
+            await self._playwright_open_wizard(params)
+            confirmed = await self._confirm_recovery(params)
+            if not confirmed:
+                raise Exception(
+                    f"Подтверждение смены пароля не появилось в Steam для {self.login}. "
+                    "Проверьте, установлен ли Chromium и верен ли device_id в maFile."
+                )
+            logger.info(f"[AutoSteamRent] Смена пароля {self.login}: мобильное подтверждение принято")
+            await self._poll_recovery(params)
+            await self._verify_recovery_code(params)
+            await self._get_next_step(params)
+            key = await self._get_rsa_key()
+            enc_old = self._encrypt(self.current_password, key["publickey_mod"], key["publickey_exp"])
+            await self._verify_old_password(params, enc_old, key["timestamp"])
+            logger.info(f"[AutoSteamRent] Смена пароля {self.login}: текущий пароль проверен")
+            await self._check_password_available(new_password)
+            key2 = await self._get_rsa_key()
+            enc_new = self._encrypt(new_password, key2["publickey_mod"], key2["publickey_exp"])
+            await self._do_change_password(params, enc_new, key2["timestamp"])
+            logger.info(f"[AutoSteamRent] Смена пароля {self.login}: ✅ пароль изменён")
+            return new_password
+        except SteamEmailVerificationRequired:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"[AutoSteamRent] Смена пароля {self.login}: ошибка в процессе ({_safe_err(e)}) — "
+                "проверяю логином новым паролем на случай, если Steam уже применил смену…"
+            )
+            if await _verify_new_password(self.mafile, new_password, self.proxy):
+                logger.info(
+                    f"[AutoSteamRent] Смена пароля {self.login}: ✅ подтверждено логином новым паролем — "
+                    "смена прошла на стороне Steam, несмотря на ошибку в процессе"
+                )
+                return new_password
+            raise
+        finally:
+            try:
+                if self._steam and hasattr(self._steam, '_requests') and self._steam._requests:
+                    await self._steam._requests.close()
+            except Exception:
+                pass
 
     async def _login_steam(self):
         for attempt in range(3):
@@ -484,11 +625,11 @@ class SteamPasswordChanger:
                 secs_left = SteamGuard._seconds_until_next_window()
                 if secs_left < 10:
                     wait = secs_left + 3
-                    logger.info(f"[AutoSteamRent] Смена пароля: {self.login} — ожидание TOTP ({wait}с)")
+                    logger.info(f"[AutoSteamRent] Смена пароля {self.login}: жду новый Steam Guard код ({wait}с)")
                     await asyncio.sleep(wait)
                     await SteamGuard.sync_time_async()
                 await self._steam.login_to_steam()
-                logger.info(f"[AutoSteamRent] Авторизация: {self.login} — OK")
+                logger.info(f"[AutoSteamRent] Смена пароля {self.login}: вход в Steam — OK")
                 await asyncio.sleep(2)
                 for wu in (f"{self.HELP}/en/", "https://steamcommunity.com/my/"):
                     try:
@@ -505,9 +646,12 @@ class SteamPasswordChanger:
                     await asyncio.sleep(wait)
                     await SteamGuard.sync_time_async()
                 elif "RateLimitExceeded" in err:
-                    await asyncio.sleep(30 * (attempt + 1))
+                    await asyncio.sleep(15 * (attempt + 1))
                 elif "InvalidPassword" in err:
-                    raise Exception(f"Неверный пароль для {self.login}")
+                    raise Exception(
+                        f"Текущий пароль аккаунта {self.login} неверен — "
+                        "обновите пароль в боте через меню аккаунта."
+                    )
                 else:
                     if attempt >= 2:
                         raise
@@ -536,8 +680,27 @@ class SteamPasswordChanger:
                 elif hasattr(resp, 'real_url'):
                     final_url = str(resp.real_url)
                 history = getattr(resp, "history", []) or []
+                location_urls = []
+                try:
+                    resp_no_redir = await self._steam.raw_request(
+                        "GET", url,
+                        headers={
+                            "Accept": "text/html,*/*",
+                            "Referer": "https://store.steampowered.com/",
+                            "User-Agent": self.UA,
+                        },
+                        allow_redirects=False
+                    )
+                    loc = None
+                    if hasattr(resp_no_redir, 'headers'):
+                        loc = resp_no_redir.headers.get("Location") or resp_no_redir.headers.get("location")
+                    if loc:
+                        location_urls.append(loc)
+                        logger.debug(f"[AutoSteamRent] Location header: {loc[:150]}")
+                except Exception as e:
+                    logger.debug(f"[AutoSteamRent] no-redir request failed: {e}")
                 logger.debug(f"[AutoSteamRent] WizardParams {url[:55]} -> {final_url[:100]} history={len(history)}")
-                all_urls = [final_url] + [str(getattr(h, "url", "")) for h in history]
+                all_urls = [final_url] + [str(getattr(h, "url", "")) for h in history] + location_urls
                 for src in all_urls:
                     if "s=" in src and "issueid=" in src:
                         try:
@@ -579,36 +742,66 @@ class SteamPasswordChanger:
                 logger.warning(f"[AutoSteamRent] WizardParams URL failed {url}: {e}")
         raise Exception(f"Не удалось получить wizard params для {self.login}")
 
+    async def _open_wizard_via_http(self, wizard_url: str) -> bool:
+        try:
+            resp = await self._steam.raw_request(
+                "GET", wizard_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,*/*",
+                    "Referer": f"{self.HELP}/en/",
+                    "User-Agent": self.UA,
+                },
+                allow_redirects=True,
+            )
+            body = await self._read_body(resp)
+            low = body.lower()
+            checks = {
+                "authenticator": "authenticator" in low,
+                "steam_guard": "steam guard" in low,
+                "email": "email" in low,
+                "we_sent": ("we've sent" in low or "we have sent" in low or "has been sent" in low
+                            or "sent a" in low),
+                "enter_code": "enter the code" in low or "enter your" in low,
+                "confirm": "confirm" in low,
+                "verify": "verify" in low,
+            }
+            logger.debug(
+                f"[AutoSteamRent] EnterCode page {self.login}: len={len(body)} "
+                + " ".join(f"{k}={int(v)}" for k, v in checks.items())
+            )
+            visible = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
+            visible = re.sub(r"<[^>]+>", " ", visible)
+            visible = re.sub(r"\s+", " ", visible).strip()
+            idx = -1
+            for kw in ("recover", "send a code", "enter the code", "authenticator",
+                       "your phone", "by email", "email address", "we sent"):
+                idx = visible.lower().find(kw)
+                if idx != -1:
+                    break
+            snippet = visible[max(0, idx - 120): idx + 600] if idx != -1 else visible[:600]
+            logger.debug(f"[AutoSteamRent] page text {self.login}: {snippet}")
+            logger.info(f"[AutoSteamRent] Смена пароля {self.login}: страница восстановления открыта (HTTP, без браузера)")
+            await asyncio.sleep(3)
+            return True
+        except Exception as e:
+            logger.warning(f"[AutoSteamRent] HTTP wizard fallback не удался: {e}")
+            return False
+
     async def _playwright_open_wizard(self, params: PasswordChangeParams):
         wizard_url = (
             f"{self.HELP}/en/wizard/HelpWithLoginInfoEnterCode"
             f"?s={params.s}&account={params.account}&reset={params.reset}"
             f"&lost={params.lost}&issueid={params.issueid}"
         )
+        playwright_ok = False
         try:
             from playwright.async_api import async_playwright
-        except ImportError:
-            logger.warning("[AutoSteamRent] Playwright не установлен — продолжаем без браузера")
-            return
-        cookies_for_pw = []
-        for domain in ["help.steampowered.com", "store.steampowered.com", "steamcommunity.com"]:
+            if not _chromium_ready.wait(timeout=10):
+                raise RuntimeError("Chromium not ready")
+            pw = None
+            browser = None
             try:
-                dc = await self._steam.cookies(domain)
-                if isinstance(dc, dict):
-                    for name, value in dc.items():
-                        cookies_for_pw.append({
-                            "name": name,
-                            "value": str(value),
-                            "domain": f".{domain}",
-                            "path": "/"
-                        })
-            except Exception as e:
-                logger.debug(f"[AutoSteamRent] cookies {domain}: {e}")
-        pw = None
-        browser = None
-        try:
-            pw = await async_playwright().start()
-            try:
+                pw = await async_playwright().start()
                 browser = await pw.chromium.launch(
                     headless=True,
                     args=[
@@ -623,38 +816,64 @@ class SteamPasswordChanger:
                         "--disable-background-networking",
                     ]
                 )
-            except Exception as e:
-                logger.warning(f"[AutoSteamRent] Chromium не запустился: {e} — продолжаем без браузера")
-                return
-            context = await browser.new_context(
-                user_agent=self.UA,
-                locale="en-US",
-                viewport={"width": 1280, "height": 720}
-            )
-            if cookies_for_pw:
-                await context.add_cookies(cookies_for_pw)
-            page = await context.new_page()
-            try:
-                await page.goto(wizard_url, wait_until="domcontentloaded", timeout=30000)
-                logger.info(f"[AutoSteamRent] Playwright: wizard загружен")
-            except Exception as e:
-                logger.debug(f"[AutoSteamRent] Playwright wizard goto: {e}")
-            await asyncio.sleep(3)
+                cookies_for_pw = []
+                for domain in ["help.steampowered.com", "store.steampowered.com", "steamcommunity.com"]:
+                    try:
+                        dc = await self._steam.cookies(domain)
+                        if isinstance(dc, dict):
+                            for name, value in dc.items():
+                                cookies_for_pw.append({
+                                    "name": name, "value": str(value),
+                                    "domain": f".{domain}", "path": "/"
+                                })
+                    except Exception as e:
+                        logger.debug(f"[AutoSteamRent] cookies {domain}: {e}")
+                context = await browser.new_context(
+                    user_agent=self.UA, locale="en-US",
+                    viewport={"width": 1280, "height": 720}
+                )
+                if cookies_for_pw:
+                    await context.add_cookies(cookies_for_pw)
+                page = await context.new_page()
+                try:
+                    await page.goto(wizard_url, wait_until="domcontentloaded", timeout=30000)
+                    logger.info(f"[AutoSteamRent] Смена пароля {self.login}: страница восстановления открыта (браузер)")
+                    playwright_ok = True
+                except Exception as e:
+                    logger.debug(f"[AutoSteamRent] Playwright wizard goto: {e}")
+                await asyncio.sleep(3)
+            finally:
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                if pw:
+                    try:
+                        await pw.stop()
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.warning(f"[AutoSteamRent] Playwright ошибка (non-critical): {e} — продолжаем без браузера")
-        finally:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            if pw:
-                try:
-                    await pw.stop()
-                except Exception:
-                    pass
+            logger.warning(f"[AutoSteamRent] Playwright недоступен ({e}) — используем HTTP fallback")
+        if not playwright_ok:
+            await self._open_wizard_via_http(wizard_url)
 
-    async def _confirm_recovery(self, params: PasswordChangeParams) -> bool:
+    def _find_conf_target(self, confs: list, cid_str: str):
+        target = next((c for c in confs if str(c.get("creator_id", "")) == cid_str), None)
+        if target is None:
+            for c in confs:
+                type_id = int(c.get("type", 0))
+                type_name = str(c.get("type_name", "")).lower()
+                summary = str(c.get("summary", "")).lower()
+                if type_id == 6 or any(x in type_name for x in ("recovery", "password", "account")) \
+                        or any(x in summary for x in ("recovery", "password", "change")):
+                    target = c
+                    break
+        if target is None and len(confs) == 1:
+            target = confs[0]
+        return target
+
+    async def _confirm_via_getlist(self, params: PasswordChangeParams) -> bool:
         cid_str = str(params.s)
         empty_in_a_row = 0
         for attempt in range(20):
@@ -689,57 +908,40 @@ class SteamPasswordChanger:
                     await asyncio.sleep(3)
                     continue
                 if not data.get("success"):
-                    logger.warning(
-                        f"[AutoSteamRent] getlist not success "
-                        f"(login={self.login}, sid={self.steamid}, dev={self.device_id[:12]}..): {data}"
-                    )
+                    logger.warning(f"[AutoSteamRent] getlist not success: {data}")
                     await asyncio.sleep(3)
                     continue
                 confs = data.get("conf", [])
-                logger.info(
-                    f"[AutoSteamRent] getlist attempt {attempt+1}/20: "
-                    f"{len(confs)} confirmation(s) for {self.login}"
+                if attempt == 0:
+                    idfp = sha1((self.identity_secret or "").encode()).hexdigest()[:8]
+                    logger.debug(
+                        f"[AutoSteamRent] identity {self.login}: steamid={self.steamid} "
+                        f"device_id={self.device_id} id_secret_fp={idfp} "
+                        f"t_offset={SteamGuard._time_offset}"
+                    )
+                    logger.debug(
+                        f"[AutoSteamRent] getlist raw {self.login}: "
+                        f"{json.dumps(data, ensure_ascii=False)[:600]}"
+                    )
+                logger.debug(
+                    f"[AutoSteamRent] getlist попытка {attempt+1}/20: "
+                    f"{len(confs)} подтв. для {self.login}"
                 )
                 if not confs:
                     empty_in_a_row += 1
                     if empty_in_a_row == 3:
                         logger.warning(
-                            f"[AutoSteamRent] {self.login}: {empty_in_a_row} пустых getlist подряд. "
-                            "Возможные причины: 1) IP бота не доверен Steam — войди в Steam с этого IP и подтверди письмом; "
-                            "2) device_id в maFile неверный; 3) confirmation уже была отклонена."
+                            f"[AutoSteamRent] {self.login}: {empty_in_a_row} пустых getlist подряд — "
+                            "подтверждение не появилось. Проверьте: браузер открыл wizard (Playwright), "
+                            "device_id в maFile, доверенный IP."
                         )
-                        if tg_logs:
-                            tg_logs.error(
-                                f"⚠️ {self.login}: Steam не выдаёт подтверждение смены пароля.\n"
-                                "Проверьте: 1) IP бота (нужен trusted для этого аккаунта), "
-                                "2) device_id в maFile, 3) не заблокирован ли аккаунт."
-                            )
                     await asyncio.sleep(3)
                     continue
                 empty_in_a_row = 0
-                for ci in confs:
-                    logger.debug(
-                        f"[AutoSteamRent]   conf id={ci.get('id')} type={ci.get('type')} "
-                        f"type_name={ci.get('type_name')} creator_id={ci.get('creator_id')} "
-                        f"summary={ci.get('summary')}"
-                    )
-                target = next(
-                    (ci for ci in confs if str(ci.get("creator_id", "")) == cid_str),
-                    None
+                logger.info(
+                    f"[AutoSteamRent] Смена пароля {self.login}: найдено подтверждений — {len(confs)}, подтверждаю…"
                 )
-                if target is None:
-                    for ci in confs:
-                        type_id = int(ci.get("type", 0))
-                        type_name = str(ci.get("type_name", "")).lower()
-                        summary = str(ci.get("summary", "")).lower()
-                        if type_id == 6 or any(x in type_name for x in ("recovery", "password", "account")) \
-                                or any(x in summary for x in ("recovery", "password", "change")):
-                            target = ci
-                            logger.debug(f"[AutoSteamRent] fallback by type/summary: {type_name!r} {summary!r}")
-                            break
-                if target is None and len(confs) == 1:
-                    target = confs[0]
-                    logger.debug(f"[AutoSteamRent] fallback: единственная confirmation (creator_id={confs[0].get('creator_id')}, expected {cid_str})")
+                target = self._find_conf_target(confs, cid_str)
                 if target is None:
                     logger.debug(
                         f"[AutoSteamRent] attempt {attempt+1}: creator_id {cid_str} не найден среди "
@@ -772,15 +974,18 @@ class SteamPasswordChanger:
                     logger.warning(f"[AutoSteamRent] ajaxop error: {e}")
                     await asyncio.sleep(3)
                     continue
-                logger.info(f"[AutoSteamRent] ajaxop result for {self.login}: {result}")
+                logger.debug(f"[AutoSteamRent] ajaxop ответ {self.login}: {result}")
                 if result.get("success"):
                     return True
-                logger.error(f"[AutoSteamRent] Подтверждение отклонено: {result}")
+                logger.error(f"[AutoSteamRent] Смена пароля {self.login}: Steam отклонил подтверждение: {result}")
                 return False
             except Exception as e:
-                logger.warning(f"[AutoSteamRent] Подтверждение попытка {attempt+1}: {e}")
+                logger.warning(f"[AutoSteamRent] getlist попытка {attempt+1}: {e}")
                 await asyncio.sleep(3)
         return False
+
+    async def _confirm_recovery(self, params: PasswordChangeParams) -> bool:
+        return await self._confirm_via_getlist(params)
 
     async def _get_sessionid(self) -> str:
         try:
@@ -794,6 +999,18 @@ class SteamPasswordChanger:
         except Exception:
             pass
         raise Exception("Не удалось получить sessionid для help.steampowered.com")
+
+    async def _read_body(self, resp) -> str:
+        try:
+            if isinstance(resp, bytes):
+                return resp.decode("utf-8", errors="replace")
+            if isinstance(resp, str):
+                return resp
+            if hasattr(resp, 'text') and callable(resp.text):
+                return await resp.text()
+            return str(resp) if resp is not None else ""
+        except Exception:
+            return ""
 
     async def _parse_response(self, resp, url: str) -> dict:
         if isinstance(resp, bytes):
@@ -977,12 +1194,13 @@ class SteamPasswordChanger:
         pk = rsa.PublicKey(n=int(mod, 16), e=int(exp, 16))
         return base64.b64encode(rsa.encrypt(password.encode("ascii"), pk)).decode()
 
-async def change_password_async(mafile: dict, current_password: str) -> str:
-    return await SteamPasswordChanger(mafile, current_password).change_password()
+async def change_password_async(mafile: dict, current_password: str, new_password: str, proxy: str = None) -> str:
+    return await SteamPasswordChanger(mafile, current_password, new_password, proxy=proxy).change_password()
 
-def change_password_sync(mafile: dict, current_password: str, acc_id: int = 0) -> str:
+def change_password_sync(mafile: dict, current_password: str, acc_id: int = 0, proxy: str = None) -> str:
     lock = _get_acc_lock(acc_id) if acc_id else _pwd_change_lock
     with lock:
+        new_password = _gen_password(20)
         result = [None]
         error = [None]
         loop_ref = [None]
@@ -990,7 +1208,7 @@ def change_password_sync(mafile: dict, current_password: str, acc_id: int = 0) -
         done_evt = threading.Event()
         async def _runner():
             main_task_ref[0] = asyncio.current_task()
-            return await change_password_async(mafile, current_password)
+            return await change_password_async(mafile, current_password, new_password, proxy=proxy)
         def _run():
             loop = asyncio.new_event_loop()
             loop_ref[0] = loop
@@ -1031,17 +1249,36 @@ def change_password_sync(mafile: dict, current_password: str, acc_id: int = 0) -
                     pass
             done_evt.wait(timeout=15)
             if t.is_alive():
+                if _verify_new_password_sync(mafile, new_password, proxy):
+                    logger.info(
+                        f"[AutoSteamRent] Смена пароля {mafile.get('account_name', '')}: "
+                        "✅ подтверждено логином после таймаута — смена прошла на стороне Steam"
+                    )
+                    return new_password
                 raise Exception("Password change timed out (worker did not stop)")
+            if _verify_new_password_sync(mafile, new_password, proxy):
+                logger.info(
+                    f"[AutoSteamRent] Смена пароля {mafile.get('account_name', '')}: "
+                    "✅ подтверждено логином после таймаута — пароль реально сменился"
+                )
+                return new_password
             raise Exception("Password change timed out")
         if error[0]:
+            if "cancelled (timeout)" in str(error[0]) and _verify_new_password_sync(mafile, new_password, proxy):
+                logger.info(
+                    f"[AutoSteamRent] Смена пароля {mafile.get('account_name', '')}: "
+                    "✅ подтверждено логином после отмены — смена прошла на стороне Steam"
+                )
+                return new_password
             raise error[0]
         if result[0] is None:
             raise Exception("Password change returned no result")
         return result[0]
 
 class LotConfig(BaseModel):
-    tag: str
-    hours: int
+    account_ids: List[int] = []
+    hours: int = 24
+    subcategory_id: Optional[int] = None
     class Config:
         extra = "allow"
 
@@ -1049,7 +1286,7 @@ class MessagesConfig(BaseModel):
     order_completed: str  = ("✅ Данные от аккаунта:\n∟ Логин: $login\n∟ Пароль: $password\n"
                              "∟ Аренда на: $rent_period\n\n⚠️ Для входа вам понадобится Steam Guard код.\n"
                              "Напишите !code чтобы получить код")
-    guard_code: str       = "✅ Steam Guard код: $code\n∟ Действителен ~30 секунд\n∟ Аренда до: $end_time"
+    guard_code: str       = "✅ Steam Guard код ($login): $code\n∟ Действителен ~30 секунд\n∟ Аренда до: $end_time"
     rent_over: str        = "⛔ Аренда завершена!\n∟ Пароль изменён"
     warning: str          = "⚠️ Аренда заканчивается через 10 минут!"
     extended: str         = "✅ Аренда продлена на +$hours ч.\n∟ Окончание: $end_time"
@@ -1058,6 +1295,7 @@ class MessagesConfig(BaseModel):
     time_info: str        = "✅ Осталось: $remaining\n∟ Окончание: $end_time"
     error_msg: str        = "❌ Произошла ошибка! Ожидайте ответа продавца"
     no_accounts: str      = "❌ Нет свободных аккаунтов! Средства будут возвращены"
+    processing_delay: str = "⏳ Секунду, обрабатываем ваш заказ вручную — не переживайте, скоро всё будет"
     refunded: str         = "✅ Средства возвращены"
     rent_expired: str     = "⛔ Время аренды истекло!"
     no_order: str         = "❌ Активный заказ не найден"
@@ -1069,6 +1307,7 @@ class MessagesConfig(BaseModel):
     extend_no_lot: str    = "❌ Лот для продления не найден, обратитесь к продавцу"
     stock_info: str       = "📦 Доступно для аренды:\n$stock_list"
     stock_empty: str      = "❌ Сейчас нет доступных аккаунтов"
+    no_code_refund: str   = "⏰ Вы не начали аренду в отведённое время — средства возвращены автоматически."
     DESCRIPTIONS: ClassVar[Dict[str, str]] = {
         "order_completed":  "📋 Выдача данных",
         "guard_code":       "🔑 Steam Guard код",
@@ -1081,6 +1320,7 @@ class MessagesConfig(BaseModel):
         "rent_expired":     "⏰ Время истекло",
         "error_msg":        "❌ Общая ошибка",
         "no_accounts":      "📭 Нет аккаунтов",
+        "processing_delay": "⏳ Задержка (ручная обработка)",
         "refunded":         "💰 Возврат",
         "no_order":         "🔍 Заказ не найден",
         "no_account":       "👤 Аккаунт не найден",
@@ -1091,6 +1331,32 @@ class MessagesConfig(BaseModel):
         "extend_no_lot":    "❌ Лот не найден",
         "stock_info":       "📦 Наличие",
         "stock_empty":      "📭 Нет аккаунтов (склад)",
+        "no_code_refund":   "⏰ Авто-возврат (нет !code)",
+    }
+    VARIABLES: ClassVar[Dict[str, str]] = {
+        "order_completed":  "$login $password $rent_period $end_time $buyer $hours $id",
+        "guard_code":       "$code $end_time $login",
+        "rent_over":        "$id $login $buyer",
+        "warning":          "$end_time $remaining",
+        "extended":         "$hours $end_time",
+        "auto_extended":    "$hours $end_time",
+        "bonus":            "$hours",
+        "time_info":        "$remaining $end_time",
+        "rent_expired":     "",
+        "error_msg":        "",
+        "no_accounts":      "",
+        "processing_delay": "",
+        "refunded":         "",
+        "no_order":         "",
+        "no_account":       "",
+        "code_error":       "",
+        "config_error":     "",
+        "rent_not_started": "",
+        "extend_link":      "$link $remaining",
+        "extend_no_lot":    "",
+        "stock_info":       "$stock_list",
+        "stock_empty":      "",
+        "no_code_refund":   "",
     }
     class Config:
         extra = "allow"
@@ -1106,7 +1372,6 @@ class AccountModel(BaseModel):
     login: str
     password: str
     mafile: Dict[str, Any]
-    tag: str = "default"
     allowed_hours: List[int] = [24]
     status: str = RentStatus.FREE
     current_order: Optional[str] = None
@@ -1117,6 +1382,7 @@ class AccountModel(BaseModel):
     rental_start: Optional[str] = None
     rent_hours: int = 24
     access_count: int = 0
+    error_permanent: bool = False
     class Config:
         extra = "allow"
 
@@ -1128,7 +1394,6 @@ class RentOrder:
     buyer_id: int
     acc_id: int
     acc_login: str
-    acc_tag: str
     hours: float
     status: str = RentStatus.BUSY
     warned: bool = False
@@ -1155,7 +1420,7 @@ class RentOrder:
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in (
-            "id", "chat_id", "buyer", "buyer_id", "acc_id", "acc_login", "acc_tag",
+            "id", "chat_id", "buyer", "buyer_id", "acc_id", "acc_login",
             "hours", "status", "warned", "review_claimed", "created_at",
             "is_extension", "lot_id")}
 
@@ -1165,6 +1430,7 @@ class Settings(BaseModel):
     auto_extend: bool = False
     auto_disable_lots: bool = False
     auto_enable_lots: bool = False
+    no_code_timeout: int = 20
     lots: Dict[str, Any] = {}
     review_rules: List[Dict[str, Any]] = [
         {"rent_hours": 3, "bonus_hours": 1.0}, {"rent_hours": 6, "bonus_hours": 2.0},
@@ -1175,6 +1441,8 @@ class Settings(BaseModel):
     notification_order_completed: bool = True
     notification_error: bool = True
     notification_refund: bool = True
+    pwd_change_proxy: Optional[str] = None
+    bonus_min_stars: int = 5
     class Config:
         extra = "allow"
 
@@ -1186,6 +1454,10 @@ class Settings(BaseModel):
         setattr(self.messages, k, v)
         _save_settings()
 
+    def set_bonus_min_stars(self, n: int):
+        self.bonus_min_stars = n
+        _save_settings()
+
     def has_lot(self, lot_id) -> bool:
         return str(lot_id) in self.lots
 
@@ -1193,14 +1465,24 @@ class Settings(BaseModel):
         raw = self.lots.get(str(lot_id))
         if raw is None:
             return None
-        if isinstance(raw, str):
-            return LotConfig(tag=_ntag(raw), hours=24)
         if isinstance(raw, dict):
-            return LotConfig(tag=_ntag(raw.get("tag", "default")), hours=raw.get("hours", 24))
-        return None
+            acc_ids = raw.get("account_ids")
+            if acc_ids is None:
+                single = raw.get("account_id")
+                acc_ids = [single] if single is not None else []
+            try:
+                acc_ids = [int(x) for x in acc_ids]
+            except (TypeError, ValueError):
+                acc_ids = []
+            return LotConfig(account_ids=acc_ids, hours=raw.get("hours", 24),
+                             subcategory_id=raw.get("subcategory_id"))
+        return LotConfig(account_ids=[], hours=24)
 
-    def set_lot(self, lot_id: str, tag: str, hours: int):
-        self.lots[str(lot_id)] = {"tag": _ntag(tag), "hours": hours}
+    def set_lot(self, lot_id: str, account_ids: List[int], hours: int, subcategory_id: int = None):
+        entry = {"account_ids": [int(a) for a in account_ids], "hours": hours}
+        if subcategory_id is not None:
+            entry["subcategory_id"] = subcategory_id
+        self.lots[str(lot_id)] = entry
         _save_settings()
 
     def del_lot(self, lot_id: str):
@@ -1215,13 +1497,16 @@ class Settings(BaseModel):
         _save_settings()
         return True
 
-    def find_lot_id_by_tag(self, tag: str) -> Optional[str]:
-        tag = _ntag(tag)
+    def find_lot_id_by_account(self, account_id: int) -> Optional[str]:
         for lid in self.lots:
             lc = self.get_lot(lid)
-            if lc and _ntag(lc.tag) == tag:
+            if lc and account_id in lc.account_ids:
                 return lid
         return None
+
+    def edit_lot_account(self, lot_id: str, new_account_ids: List[int]):
+        lc = self.get_lot(lot_id) or LotConfig(hours=24)
+        self.set_lot(lot_id, new_account_ids, lc.hours, subcategory_id=lc.subcategory_id)
 
     def get_review_rules(self) -> List[ReviewRule]:
         return sorted([ReviewRule(**r) for r in self.review_rules if isinstance(r, dict)],
@@ -1260,6 +1545,9 @@ _code_cooldowns: Dict[str, float] = {}
 _cooldowns_lock = threading.Lock()
 
 _processed_orders: Set[str] = set()
+
+_processed_messages: Set[str] = set()
+_processed_msg_lock = threading.Lock()
 
 class _TTLDict(dict):
     TTL_SECONDS = 1800
@@ -1316,11 +1604,11 @@ _temp_storage: Dict[int, dict] = _TTLDict()
 
 _last_assigned: Dict[str, int] = {}
 
-_data_lock = threading.Lock()
+_data_lock = threading.RLock()
 
 _processed_lock = threading.Lock()
 
-_toggling_tags: Set[str] = set()
+_toggling_accounts: Set[int] = set()
 _toggling_lock = threading.Lock()
 
 _stop_event = threading.Event()
@@ -1378,6 +1666,24 @@ def _cleanup_temp():
     if len(_temp_storage) > 200:
         _temp_storage.clear()
 
+_PREVIOUS_DEFAULTS: Dict[str, set] = {
+    "guard_code": {
+        "✅ Steam Guard код: $code\n∟ Действителен ~30 секунд\n∟ Аренда до: $end_time",
+    },
+}
+
+def _migrate_messages(messages: MessagesConfig) -> bool:
+    fresh = MessagesConfig()
+    changed = False
+    for field, old_values in _PREVIOUS_DEFAULTS.items():
+        current = getattr(messages, field, None)
+        if current in old_values:
+            setattr(messages, field, getattr(fresh, field))
+            logger.info(f"[AutoSteamRent] Сообщение '{field}' обновлено до нового дефолта")
+            changed = True
+    return changed
+
+
 def _load_all():
     global SETTINGS, ACCOUNTS, ORDERS
     raw = _load_json("settings")
@@ -1385,23 +1691,27 @@ def _load_all():
         raw["review_rules"] = [{"rent_hours": int(k), "bonus_hours": v}
                                 for k, v in raw["review_rules"].items()]
     SETTINGS = Settings(**raw)
+    if _migrate_messages(SETTINGS.messages):
+        _save_settings()
     changed = False
     for lid, val in list(SETTINGS.lots.items()):
         if isinstance(val, str):
-            SETTINGS.lots[lid] = {"tag": _ntag(val), "hours": 24}
+            SETTINGS.lots[lid] = {"hours": 24}
             changed = True
         elif isinstance(val, dict):
             val.pop("count", None)
-            if "tag" not in val:
-                val["tag"] = "default"
+            if "tag" in val and "account_id" not in val:
+                val.pop("tag", None)
+                changed = True
             if "hours" not in val:
                 val["hours"] = 24
-            changed = True
+                changed = True
     if changed:
         _save_settings()
     d = _load_json("accounts")
     if isinstance(d, list):
         for a in d:
+            a.pop("tag", None)
             if "rent_hours" in a and "allowed_hours" not in a:
                 a["allowed_hours"] = [a["rent_hours"]]
         ACCOUNTS = [AccountModel(**a) for a in d]
@@ -1412,10 +1722,10 @@ def _load_all():
         for k, v in d.items():
             v.pop("acc_ids", None)
             v.pop("is_multi", None)
+            v.pop("acc_tag", None)
             v.setdefault("is_extension", False)
             v.setdefault("lot_id", None)
             v.setdefault("acc_login", "")
-            v.setdefault("acc_tag", "")
         ORDERS = {k: RentOrder(**v) for k, v in d.items()}
     else:
         ORDERS = {}
@@ -1429,69 +1739,54 @@ class AccountRepo:
 
     @staticmethod
     def get(acc_id: int) -> Optional[AccountModel]:
-        return next((a for a in ACCOUNTS if a.id == acc_id), None)
+        with _data_lock:
+            return next((a for a in ACCOUNTS if a.id == acc_id), None)
 
     @staticmethod
     def by_order(order_id: str) -> Optional[AccountModel]:
-        return next((a for a in ACCOUNTS if a.current_order == order_id), None)
+        with _data_lock:
+            return next((a for a in ACCOUNTS if a.current_order == order_id), None)
 
     @staticmethod
-    def get_free(tag: str, hours: int = None) -> Optional[AccountModel]:
-        tag = _ntag(tag)
+    def is_free(account_id: int) -> bool:
+        acc = AccountRepo.get(account_id)
+        return bool(acc and acc.status == RentStatus.FREE)
+
+    @staticmethod
+    def get_for_lot(lot_id: str) -> Optional[AccountModel]:
+        lc = SETTINGS.get_lot(lot_id)
+        if not lc or not lc.account_ids:
+            return None
         with _data_lock:
-            candidates = [
-                a for a in ACCOUNTS
-                if _ntag(a.tag) == tag
-                and a.status == RentStatus.FREE
-                and (hours is None or hours in a.allowed_hours)
-            ]
+            for aid in lc.account_ids:
+                acc = next((a for a in ACCOUNTS if a.id == aid), None)
+                if acc and acc.status == RentStatus.FREE:
+                    return acc
+            return None
+
+    @staticmethod
+    def claim_free(account_ids: List[int], hours, order_id, buyer, buyer_id, chat_id,
+                    base_hours=None) -> Optional[AccountModel]:
+        if not account_ids:
+            return None
+        with _data_lock:
+            candidates = [a for a in ACCOUNTS if a.id in account_ids and a.status == RentStatus.FREE]
             if not candidates:
                 return None
-            last_id = _last_assigned.get(tag, 0)
-            candidates_after = [a for a in candidates if a.id > last_id]
-            chosen = candidates_after[0] if candidates_after else candidates[0]
-            _last_assigned[tag] = chosen.id
-            return chosen
-
-    @staticmethod
-    def count_free(tag: str = None) -> Dict[str, int]:
-        result = {}
-        with _data_lock:
-            snapshot = list(ACCOUNTS)
-        for a in snapshot:
-            if a.status != RentStatus.FREE:
-                continue
-            t = _ntag(a.tag)
-            if tag is not None and t != _ntag(tag):
-                continue
-            result[t] = result.get(t, 0) + 1
-        return result
-
-    @staticmethod
-    def get_free_periods(tag: str) -> List[int]:
-        tag = _ntag(tag)
-        periods = set()
-        for a in ACCOUNTS:
-            if _ntag(a.tag) == tag and a.status == RentStatus.FREE:
-                periods.update(a.allowed_hours)
-        return sorted(periods)
-
-    @staticmethod
-    def claim_free(tag, hours, order_id, buyer, buyer_id, chat_id) -> Optional[AccountModel]:
-        tag_n = _ntag(tag)
-        with _data_lock:
-            candidates = [
-                a for a in ACCOUNTS
-                if _ntag(a.tag) == tag_n
-                and a.status == RentStatus.FREE
-                and (hours is None or hours in a.allowed_hours)
-            ]
-            if not candidates:
-                return None
-            last_id = _last_assigned.get(tag_n, 0)
+            if base_hours is not None:
+                allowed = [a for a in candidates if base_hours in a.allowed_hours]
+                if allowed:
+                    candidates = allowed
+                else:
+                    logger.warning(
+                        f"[AutoSteamRent] Ни один свободный аккаунт из пула {account_ids} не разрешает "
+                        f"период {base_hours}ч в своих «Периодах» — выдаю без учёта этого ограничения"
+                    )
+            pool_key = "|".join(str(x) for x in sorted(account_ids))
+            last_id = _last_assigned.get(pool_key, 0)
             after = [a for a in candidates if a.id > last_id]
             chosen = after[0] if after else candidates[0]
-            _last_assigned[tag_n] = chosen.id
+            _last_assigned[pool_key] = chosen.id
             chosen.status = RentStatus.BUSY
             chosen.current_order = order_id
             chosen.owner = buyer
@@ -1504,19 +1799,18 @@ class AccountRepo:
             return chosen
 
     @staticmethod
-    def add(login, password, mafile, tag, allowed_hours=None) -> Tuple[bool, str]:
+    def add(login, password, mafile, allowed_hours=None) -> Tuple[bool, str]:
         if allowed_hours is None:
             allowed_hours = [24]
-        tag = _ntag(tag)
         with _data_lock:
             if any(a.login.lower() == login.lower() for a in ACCOUNTS):
                 return False, "Аккаунт уже существует"
             nid = max((a.id for a in ACCOUNTS), default=0) + 1
             ACCOUNTS.append(AccountModel(
                 id=nid, login=login, password=password, mafile=mafile,
-                tag=tag, allowed_hours=sorted(allowed_hours), rent_hours=allowed_hours[0]))
+                allowed_hours=sorted(allowed_hours), rent_hours=allowed_hours[0]))
             _save_accounts()
-        return True, f"Аккаунт {login} добавлен (ID: {nid}, тег: {tag}, периоды: {_format_periods(allowed_hours)})"
+        return True, f"Аккаунт {login} добавлен (ID: {nid}, периоды: {_format_periods(allowed_hours)})"
 
     @staticmethod
     def delete(acc_id: int) -> bool:
@@ -1567,7 +1861,17 @@ class AccountRepo:
         return None
 
     @staticmethod
-    def release(acc_id: int, new_password: str = None, error: bool = False):
+    def add_pending_hours(acc_id: int, hours: float) -> bool:
+        with _data_lock:
+            acc = AccountRepo.get(acc_id)
+            if not acc:
+                return False
+            acc.rent_hours = (acc.rent_hours or 0) + hours
+            _save_accounts()
+            return True
+
+    @staticmethod
+    def release(acc_id: int, new_password: str = None, error: bool = False, permanent: bool = False):
         with _data_lock:
             acc = AccountRepo.get(acc_id)
             if not acc:
@@ -1576,6 +1880,7 @@ class AccountRepo:
             acc.current_order = acc.owner = acc.owner_id = None
             acc.owner_chat_id = acc.rental_start = acc.rental_end = None
             acc.access_count = 0
+            acc.error_permanent = permanent if error else False
             if new_password:
                 acc.password = new_password
             _save_accounts()
@@ -1609,7 +1914,7 @@ class AccountRepo:
             acc.rent_hours = hours
             acc.access_count = 0
             ORDERS[oid] = RentOrder(id=oid, chat_id=None, buyer=buyer, buyer_id=0,
-                                    acc_id=acc.id, acc_login=acc.login, acc_tag=_ntag(acc.tag),
+                                    acc_id=acc.id, acc_login=acc.login,
                                     hours=float(hours), status=RentStatus.ACTIVE)
             _save_accounts()
             _save_orders()
@@ -1656,75 +1961,105 @@ class AccountRepo:
     @staticmethod
     def get_stats() -> dict:
         r = {s: 0 for s in (RentStatus.FREE, RentStatus.ACTIVE, RentStatus.BUSY, RentStatus.ERROR)}
-        for a in ACCOUNTS:
-            if a.status in r:
-                r[a.status] += 1
-        r["total"] = len(ACCOUNTS)
+        with _data_lock:
+            for a in ACCOUNTS:
+                if a.status in r:
+                    r[a.status] += 1
+            r["total"] = len(ACCOUNTS)
         return r
 
     @staticmethod
-    def all_tags() -> List[str]:
-        return list({_ntag(a.tag) for a in ACCOUNTS})
+    def list_all() -> List[AccountModel]:
+        with _data_lock:
+            return list(ACCOUNTS)
 
     @staticmethod
-    def find_active_by_buyer(buyer_id: int, tag: str = None) -> Optional[RentOrder]:
-        for o in ORDERS.values():
-            if o.status not in (RentStatus.ACTIVE, RentStatus.BUSY):
-                continue
-            if o.buyer_id == buyer_id:
-                if tag is None:
+    def find_active_by_buyer(buyer_id: int, account_ids: List[int] = None,
+                             chat_id=None, buyer_name: str = None) -> Optional[RentOrder]:
+        def _acc_ok(o):
+            return not account_ids or o.acc_id in account_ids
+
+        with _data_lock:
+            active = [o for o in ORDERS.values()
+                      if o.status in (RentStatus.ACTIVE, RentStatus.BUSY)]
+
+        if buyer_id and buyer_id > 0:
+            for o in active:
+                if o.buyer_id == buyer_id and _acc_ok(o):
                     return o
-                acc = AccountRepo.get(o.acc_id)
-                if acc and _ntag(acc.tag) == _ntag(tag):
+
+        if chat_id:
+            key = str(chat_id)
+            for o in active:
+                if str(o.chat_id or "") == key and _acc_ok(o):
                     return o
+
+        if buyer_name:
+            bl = buyer_name.strip().lower()
+            for o in active:
+                if o.buyer and o.buyer.strip().lower() == bl and _acc_ok(o):
+                    return o
+
         return None
+
+    @staticmethod
+    def has_any_history(chat_id, author_id=None, author_name=None) -> bool:
+        key = str(chat_id)
+        with _data_lock:
+            orders_snapshot = list(ORDERS.values())
+        for o in orders_snapshot:
+            if str(o.chat_id or "") == key:
+                return True
+        if author_id and author_id > 0:
+            for o in orders_snapshot:
+                if o.buyer_id == author_id:
+                    return True
+        if author_name:
+            al = author_name.strip().lower()
+            for o in orders_snapshot:
+                if o.buyer and o.buyer.strip().lower() == al:
+                    return True
+        return False
 
     @staticmethod
     def find_order_by_chat(chat_id, author_id=None, author_name=None) -> Optional[RentOrder]:
         key = str(chat_id)
-        for o in ORDERS.values():
-            if o.status in (RentStatus.FINISHED, RentStatus.REFUND):
-                continue
-            if str(o.chat_id or "") == key:
-                return o
+        with _data_lock:
+            orders_snapshot = list(ORDERS.values())
+            accounts_snapshot = list(ACCOUNTS)
+            orders_by_id = dict(ORDERS)
+        candidates = [
+            o for o in orders_snapshot
+            if o.status not in (RentStatus.FINISHED, RentStatus.REFUND, RentStatus.ERROR)
+            and str(o.chat_id or "") == key
+        ]
+        if candidates:
+            busy = [o for o in candidates if o.status == RentStatus.BUSY]
+            pool = busy if busy else candidates
+            return max(pool, key=lambda o: o.created_at)
         if author_id and author_id > 0:
-            for o in ORDERS.values():
-                if o.status in (RentStatus.FINISHED, RentStatus.REFUND):
+            for o in orders_snapshot:
+                if o.status in (RentStatus.FINISHED, RentStatus.REFUND, RentStatus.ERROR):
                     continue
                 if o.buyer_id == author_id:
                     return o
         if author_name:
             al = author_name.strip().lower()
-            for o in ORDERS.values():
-                if o.status in (RentStatus.FINISHED, RentStatus.REFUND):
+            for o in orders_snapshot:
+                if o.status in (RentStatus.FINISHED, RentStatus.REFUND, RentStatus.ERROR):
                     continue
                 if o.buyer and o.buyer.strip().lower() == al:
                     return o
         if author_id and author_id > 0:
-            for acc in ACCOUNTS:
+            for acc in accounts_snapshot:
                 if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY) and acc.owner_id == author_id:
-                    if acc.current_order and acc.current_order in ORDERS:
-                        return ORDERS[acc.current_order]
-        for acc in ACCOUNTS:
+                    if acc.current_order and acc.current_order in orders_by_id:
+                        return orders_by_id[acc.current_order]
+        for acc in accounts_snapshot:
             if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY) and acc.owner_chat_id:
                 if str(acc.owner_chat_id) == key:
-                    if acc.current_order and acc.current_order in ORDERS:
-                        return ORDERS[acc.current_order]
-        return None
-
-    @staticmethod
-    def find_tag_by_chat(chat_id, author_id=None, author_name=None) -> Optional[str]:
-        order = AccountRepo.find_order_by_chat(chat_id, author_id, author_name)
-        if order:
-            acc = AccountRepo.get(order.acc_id)
-            if acc:
-                return _ntag(acc.tag)
-        if author_id and author_id > 0:
-            for o in sorted(ORDERS.values(), key=lambda x: x.created_at, reverse=True):
-                if o.buyer_id == author_id:
-                    acc = AccountRepo.get(o.acc_id)
-                    if acc:
-                        return _ntag(acc.tag)
+                    if acc.current_order and acc.current_order in orders_by_id:
+                        return orders_by_id[acc.current_order]
         return None
 
 class TgLogs:
@@ -1752,19 +2087,33 @@ class TgLogs:
         if SETTINGS.notification_refund:
             self._send(f"💰 Возврат #{order_id[:12]}...\n∟ Причина: {reason}")
 
-    def lots_auto_disabled(self, tag: str, lot_ids: List[str]):
-        self._send(
-            f"🔴 Авто-выключение лотов\n"
-            f"∟ Тег: <code>{tag}</code>\n"
-            f"∟ Лоты: {', '.join(f'#{lid}' for lid in lot_ids)}"
-        )
+    def _send_one(self, chat_id, text):
+        try:
+            self.bot.send_message(chat_id, f"<b>--- Auto Steam Rent ---</b>\n{text}", parse_mode="HTML")
+        except Exception:
+            pass
 
-    def lots_auto_enabled(self, tag: str, lot_ids: List[str]):
-        self._send(
-            f"🟢 Авто-включение лотов\n"
-            f"∟ Тег: <code>{tag}</code>\n"
+    def lots_auto_disabled(self, label: str, lot_ids: List[str], chat_id=None):
+        text = (
+            f"🔴 Авто-выключение лотов\n"
+            f"∟ {label}\n"
             f"∟ Лоты: {', '.join(f'#{lid}' for lid in lot_ids)}"
         )
+        if chat_id is not None:
+            self._send_one(chat_id, text)
+        else:
+            self._send(text)
+
+    def lots_auto_enabled(self, label: str, lot_ids: List[str], chat_id=None):
+        text = (
+            f"🟢 Авто-включение лотов\n"
+            f"∟ {label}\n"
+            f"∟ Лоты: {', '.join(f'#{lid}' for lid in lot_ids)}"
+        )
+        if chat_id is not None:
+            self._send_one(chat_id, text)
+        else:
+            self._send(text)
 
 def _tmpl(template: str, **kw) -> str:
     r = template
@@ -1772,8 +2121,14 @@ def _tmpl(template: str, **kw) -> str:
         r = r.replace(f"${k}", str(v))
     return r
 
+_SEND_FP_RETRIABLE = (
+    "429", "flood", "too many", "rate",
+    "403", "unauthorized", "авторизоваться", "сесси", "session",
+    "502", "503", "504", "timeout", "timed out", "connection",
+)
+
 def _send_fp(c, chat_id, text):
-    delays = (0, 3, 8)
+    delays = (0, 3, 8, 15, 30)
     last_err = None
     for d in delays:
         if d:
@@ -1784,7 +2139,7 @@ def _send_fp(c, chat_id, text):
         except Exception as e:
             last_err = e
             es = str(e).lower()
-            if not any(s in es for s in ("429", "flood", "too many", "rate")):
+            if not any(s in es for s in _SEND_FP_RETRIABLE):
                 logger.debug(f"[AutoSteamRent] send_message non-retriable: {e}")
                 return
     logger.warning(f"[AutoSteamRent] send_message gave up after retries: {last_err}")
@@ -1809,53 +2164,46 @@ def _extract_lot_id_from_html(html: str) -> Optional[str]:
             return m.group(1)
     return None
 
+def _direct_lot_id_from_order(o) -> Optional[str]:
+    if o is None:
+        return None
+    for attr in ("offer_id", "lot_id"):
+        v = getattr(o, attr, None)
+        if v is not None:
+            return str(v)
+    return None
+
 def _find_lot_id_for_order(c, event):
     order = event.order
-    for attr in ("offer_id", "lot_id"):
-        v = getattr(order, attr, None)
-        if v is not None:
-            sv = str(v)
-            if SETTINGS.has_lot(sv):
-                return sv
+    order_id = getattr(order, "id", None)
+
+    direct_id = _direct_lot_id_from_order(order)
+    full = None
+    if direct_id is None and order_id:
+        try:
+            full = c.account.get_order(order_id)
+            direct_id = _direct_lot_id_from_order(full)
+        except Exception as e:
+            logger.debug(f"[AutoSteamRent] get_order({order_id}) fallback failed: {e}")
+    if direct_id is not None:
+        return direct_id if SETTINGS.has_lot(direct_id) else None
+
     html = getattr(order, "html", None) or ""
     extracted = _extract_lot_id_from_html(html)
     if extracted and SETTINGS.has_lot(extracted):
         return extracted
-    order_id = getattr(order, "id", None)
-    if order_id:
-        try:
-            full = c.account.get_order(order_id)
-            for attr in ("offer_id", "lot_id"):
-                v = getattr(full, attr, None)
-                if v is not None and SETTINGS.has_lot(str(v)):
-                    return str(v)
-            for attr in ("html", "description"):
-                v = getattr(full, attr, None)
-                if v:
-                    ex = _extract_lot_id_from_html(str(v))
-                    if ex and SETTINGS.has_lot(ex):
-                        return ex
-            sub = getattr(full, "subcategory", None)
-            sub_id = getattr(sub, "id", None) if sub else None
-            if sub_id is not None:
-                for lid in SETTINGS.lots.keys():
-                    cfg = SETTINGS.get_lot(lid)
-                    if cfg and getattr(cfg, "subcategory_id", None) == sub_id:
-                        return str(lid)
-        except Exception as e:
-            logger.debug(f"[AutoSteamRent] get_order({order_id}) fallback failed: {e}")
+
     description = getattr(order, "description", None) or ""
+    if not description and order_id:
+        try:
+            full = full or c.account.get_order(order_id)
+            description = getattr(full, "description", None) or ""
+        except Exception:
+            pass
     if description:
         m = _match_lot_by_description(c, description)
         if m:
             return m
-    if len(SETTINGS.lots) == 1:
-        only = next(iter(SETTINGS.lots.keys()))
-        logger.warning(
-            f"[AutoSteamRent] order={order_id}: лот не определён через API/html/description, "
-            f"но в настройках только один лот — использую {only}"
-        )
-        return only
     logger.warning(
         f"[AutoSteamRent] order={order_id}: не удалось определить lot_id "
         f"(description={description[:80]!r}, html_len={len(html)})"
@@ -1873,85 +2221,119 @@ def _match_lot_by_description(c, description):
     our_lots = [lot for lot in all_lots if str(lot.id) in our_lot_ids]
     if not our_lots:
         return None
-    desc_clean = description.strip().lower()
-    desc_parts = [p.strip() for p in desc_clean.split(',') if p.strip()]
+
+    def _norm(s: str) -> str:
+        return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+    desc_norm = _norm(description)
+    if not desc_norm:
+        return None
+
     for lot in our_lots:
-        lot_title = (getattr(lot, 'description', None) or getattr(lot, 'title', None) or '').strip().lower()
-        if lot_title and desc_clean == lot_title:
+        lot_title = _norm(getattr(lot, 'description', None) or getattr(lot, 'title', None) or '')
+        if lot_title and desc_norm == lot_title:
             return str(lot.id)
-    best_id, best_score = None, 0.0
+
+    matched = []
     for lot in our_lots:
-        lot_title = (getattr(lot, 'description', None) or getattr(lot, 'title', None) or '').strip().lower()
-        if not lot_title:
-            continue
-        lot_parts = [p.strip() for p in lot_title.split(',') if p.strip()]
-        if not lot_parts or not desc_parts:
-            continue
-        matching = sum(1 for dp in desc_parts if dp in lot_parts)
-        if matching > 0:
-            score = matching / max(len(desc_parts), len(lot_parts))
-            if score > best_score:
-                best_score = score
-                best_id = str(lot.id)
-    return best_id if best_score >= 0.8 else None
+        lot_title = _norm(getattr(lot, 'description', None) or getattr(lot, 'title', None) or '')
+        if lot_title and lot_title in desc_norm:
+            matched.append(str(lot.id))
+    if len(matched) == 1:
+        logger.debug(f"[AutoSteamRent] Лот #{matched[0]} подошёл по вхождению заголовка")
+        return matched[0]
+    if len(matched) > 1:
+        logger.warning(
+            f"[AutoSteamRent] Неоднозначное сопоставление лота по описанию "
+            f"(подошли: {matched}) — выдача отменена"
+        )
+    return None
 
 def _get_extend_lot_id(order: RentOrder) -> Optional[str]:
     if order.lot_id and SETTINGS.has_lot(order.lot_id):
         return order.lot_id
-    acc = AccountRepo.get(order.acc_id)
-    if acc:
-        return SETTINGS.find_lot_id_by_tag(_ntag(acc.tag))
-    return None
+    return SETTINGS.find_lot_id_by_account(order.acc_id)
 
-def _build_stock_message(tag: str = None) -> str:
-    free_counts = AccountRepo.count_free(tag)
-    if not free_counts:
-        return SETTINGS.messages.stock_empty
+def _build_stock_message() -> str:
     lines = []
-    for t in sorted(free_counts.keys()):
-        periods = AccountRepo.get_free_periods(t)
-        lines.append(f"∟ {t}: {free_counts[t]} шт. ({_format_periods(periods) if periods else '—'})")
+    for lid in sorted(SETTINGS.lots, key=lambda x: (len(x), x)):
+        lc = SETTINGS.get_lot(lid)
+        if lc and lc.account_ids and any(AccountRepo.is_free(aid) for aid in lc.account_ids):
+            lines.append(f"∟ Лот #{lid} — в наличии ({_period_label(lc.hours)})")
+    if not lines:
+        return SETTINGS.messages.stock_empty
     return _tmpl(SETTINGS.messages.stock_info, stock_list="\n".join(lines))
 
 def _recover_account(c, acc, order, reason):
-    acc_tag = _ntag(acc.tag)
-    was_last_free = SETTINGS.auto_enable_lots and cardinal_ref and \
-        AccountRepo.count_free(acc_tag).get(acc_tag, 0) == 0
+    account_id = acc.id
+    should_auto_enable = SETTINGS.auto_enable_lots and cardinal_ref is not None
     try:
-        np = change_password_sync(acc.mafile, acc.password, acc.id)
+        np = change_password_sync(acc.mafile, acc.password, acc.id, proxy=SETTINGS.pwd_change_proxy)
+        with _data_lock:
+            current = AccountRepo.get(acc.id)
+            extended_order_id = current.current_order if current else None
+        original_order_id = order.id if order else None
+        if extended_order_id and extended_order_id != original_order_id:
+            with _data_lock:
+                if current:
+                    current.password = np
+                    _save_accounts()
+            if order:
+                order.update(status=RentStatus.FINISHED)
+            logger.info(f"[AutoSteamRent] {acc.login}: пароль обновлён, аккаунт на продлении {extended_order_id} — не освобождаем")
+            return
         AccountRepo.release(acc.id, np)
-        if was_last_free:
-            def _auto_enable_recover(tag=acc_tag):
-                toggled = _toggle_fp_lots_for_tag(cardinal_ref, tag, True)
-                if toggled and tg_logs:
-                    tg_logs.lots_auto_enabled(tag, toggled)
+        if should_auto_enable:
+            def _auto_enable_recover(aid=account_id):
+                enabled, disabled = _resync_lots_for_account(cardinal_ref, aid)
+                if enabled and tg_logs:
+                    tg_logs.lots_auto_enabled(f"Аккаунт: <code>#{aid}</code>", enabled)
             threading.Thread(target=_auto_enable_recover, daemon=True).start()
         if order:
             order.update(status=RentStatus.FINISHED)
             if reason == "TIME" and order.chat_id:
-                _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.rent_over, id=order.id))
+                _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.rent_over,
+                                                   id=order.id, login=acc.login,
+                                                   buyer=order.buyer or ""))
     except SteamEmailVerificationRequired as e:
         logger.error(f"[AutoSteamRent] Email-verification: {acc.login} — {e}")
-        AccountRepo.release(acc.id, error=True)
+        AccountRepo.release(acc.id, error=True, permanent=True)
         if tg_logs:
-            tg_logs.error(f"⚠️ {acc.login}: Steam требует email-подтверждение recovery. "
-                          f"Залогинься с IP бота и подтверди письмом.")
-        if SETTINGS.autoback_on_error and order:
+            tg_logs.error(
+                f"🔐 <b>Смена пароля приостановлена — нужно ваше действие</b>\n"
+                f"∟ Аккаунт: <code>{acc.login}</code>\n"
+                f"∟ Что случилось: Steam требует подтверждение входа по почте\n"
+                f"∟ Статус: ❌ ERROR (аккаунт временно снят с аренды)\n"
+                f"∟ Что делать: войдите в этот аккаунт через Steam, подтвердите вход из письма, "
+                f"затем верните аккаунт в «Свободен» через меню"
+            )
+        if SETTINGS.autoback_on_error and order and reason == "CLOSED_EARLY":
             if _do_refund(c, order.id):
                 order.update(status=RentStatus.REFUND)
                 if tg_logs:
-                    tg_logs.refund(order.id, f"Email-verification required: {acc.login}")
+                    tg_logs.refund(order.id, f"Смена пароля: требуется email-подтверждение ({acc.login})")
         return
     except Exception as e:
+        err_str = str(e)
+        is_permanent = ("InvalidPassword" in err_str or "неверный пароль" in err_str.lower()
+                         or "неверен" in err_str.lower())
         logger.error(f"[AutoSteamRent] Смена пароля не удалась: {acc.login} — {e}")
-        AccountRepo.release(acc.id, error=True)
+        if not is_permanent:
+            _pwd_retry_cooldown[acc.id] = time.time() + _PWD_RETRY_COOLDOWN
+        AccountRepo.release(acc.id, error=True, permanent=is_permanent)
         if tg_logs:
-            tg_logs.error(f"Смена пароля: {acc.login} - {_safe_err(e)}")
-        if SETTINGS.autoback_on_error and order:
+            tg_logs.error(
+                f"🔑 <b>Не удалось сменить пароль</b>\n"
+                f"∟ Аккаунт: <code>{acc.login}</code>\n"
+                f"∟ Ошибка: {_safe_err(e)}\n"
+                f"∟ Статус: ❌ ERROR (аккаунт временно снят с аренды)\n"
+                f"∟ Что делать: {_pwd_error_hint(e)}"
+            )
+        if SETTINGS.autoback_on_error and order and reason == "CLOSED_EARLY":
             if _do_refund(c, order.id):
                 order.update(status=RentStatus.REFUND)
                 if tg_logs:
-                    tg_logs.refund(order.id, f"Ошибка смены пароля: {acc.login}")
+                    tg_logs.refund(order.id, f"Смена пароля не удалась, средства возвращены ({acc.login})")
 
 def _stats_text() -> str:
     now = time.time()
@@ -1998,7 +2380,6 @@ def _order_detail_text(order_id: str):
     txt += f"∟ Аккаунт: <code>{acc_name}</code>\n"
     if o.lot_id:
         txt += f"∟ Лот: <code>{o.lot_id}</code>\n"
-    txt += f"∟ Тег: <code>{o.acc_tag or '—'}</code>\n"
     txt += f"∟ Период: <code>{_period_label(int(o.hours))}</code>\n"
     txt += f"∟ Создан: <code>{o.created_at[:19]}</code>\n"
     if o.is_extension:
@@ -2009,6 +2390,52 @@ def _order_detail_text(order_id: str):
         chat_url = FUNPAY_CHAT_URL.format(o.chat_id)
         txt += f"∟ Чат: <a href='{chat_url}'>Перейти</a>\n"
     return txt, o
+
+def _our_subcategory_ids() -> set:
+    ids = set()
+    for lid in list(SETTINGS.lots.keys()):
+        lc = SETTINGS.get_lot(lid)
+        sid = getattr(lc, 'subcategory_id', None) if lc else None
+        if sid is not None:
+            try:
+                ids.add(int(sid))
+            except (TypeError, ValueError):
+                pass
+    return ids
+
+def _order_subcategory_id(order) -> Optional[int]:
+    sub = getattr(order, 'subcategory', None)
+    sid = getattr(sub, 'id', None) if sub is not None else None
+    try:
+        return int(sid) if sid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+def _handle_unidentified_lot(c, order, order_id):
+    our_subs = _our_subcategory_ids()
+    order_sub = _order_subcategory_id(order)
+    if not our_subs or order_sub is None or order_sub not in our_subs:
+        logger.info(f"[AutoSteamRent] Заказ {order_id}: лот не определён, "
+                    f"подкатегория не наша (sub={order_sub}) — пропуск")
+        return
+    description = (getattr(order, 'description', None) or '')[:200]
+    logger.warning(f"[AutoSteamRent] Заказ {order_id}: наш раздел, но лот не опознан "
+                   f"(description={description!r}) — выдача отменена")
+    chat_id = getattr(order, 'chat_id', None) or getattr(order, 'node_id', 0)
+    if SETTINGS.autoback_on_error:
+        _send_fp(c, chat_id, SETTINGS.messages.no_accounts)
+        if _do_refund(c, order_id):
+            _send_fp(c, chat_id, SETTINGS.messages.refunded)
+            if tg_logs:
+                tg_logs.refund(order_id, f"Лот не опознан: {description[:80]}")
+            return
+    if tg_logs:
+        tg_logs.error(
+            f"⚠️ <b>Лот не опознан — выдача отменена</b>\n"
+            f"∟ Заказ: <code>{str(order_id)[:20]}</code>\n"
+            f"∟ Описание: <code>{description[:120]}</code>\n"
+            f"∟ Что делать: добавьте этот лот в настройках плагина"
+        )
 
 def process_new_order(c, event):
     if not SETTINGS or not SETTINGS.enabled:
@@ -2025,75 +2452,148 @@ def process_new_order(c, event):
         _processed_orders.add(order_id)
     if order_id in ORDERS:
         return
+    try:
+        _process_new_order_body(c, event, order, order_id)
+    except Exception as e:
+        with _processed_lock:
+            _processed_orders.discard(order_id)
+        logger.error(f"[AutoSteamRent] process_new_order({order_id}) упал с ошибкой: {e}", exc_info=True)
+        if tg_logs:
+            tg_logs.error(
+                f"❌ <b>Ошибка обработки заказа</b>\n"
+                f"∟ Заказ: <code>{str(order_id)[:20]}</code>\n"
+                f"∟ Ошибка: {_safe_err(e)}\n"
+                f"∟ Заказ не выдан ботом — будет обработан повторно при следующем событии"
+            )
+
+def _process_new_order_body(c, event, order, order_id):
     _cleanup_processed()
     lot_id = _find_lot_id_for_order(c, event)
     if not lot_id:
+        _handle_unidentified_lot(c, order, order_id)
         return
     lot_cfg = SETTINGS.get_lot(lot_id)
     if not lot_cfg:
+        _handle_unidentified_lot(c, order, order_id)
         return
-    tag = _ntag(lot_cfg.tag)
-    hours = lot_cfg.hours if lot_cfg.hours > 0 else 24
+    account_ids = lot_cfg.account_ids
+    if not account_ids:
+        chat_id = getattr(order, 'chat_id', None) or getattr(order, 'node_id', 0)
+        buyer = getattr(order, 'buyer_username', None) or getattr(order, 'buyer', 'Unknown')
+        buyer_id = getattr(order, 'buyer_id', 0) or 0
+        logger.warning(f"[AutoSteamRent] Лот #{lot_id} не привязан к аккаунтам, заказ {order_id} пропущен")
+        with _data_lock:
+            ORDERS[order_id] = RentOrder(id=order_id, chat_id=chat_id, buyer=buyer, buyer_id=buyer_id,
+                                         acc_id=0, acc_login="", hours=0.0,
+                                         status=RentStatus.ERROR, lot_id=lot_id)
+            _save_orders()
+        if SETTINGS.autoback_on_error:
+            _send_fp(c, chat_id, SETTINGS.messages.config_error)
+            if _do_refund(c, order_id):
+                _send_fp(c, chat_id, SETTINGS.messages.refunded)
+                if tg_logs:
+                    tg_logs.refund(order_id, f"Лот #{lot_id} не привязан к аккаунтам")
+        else:
+            _send_fp(c, chat_id, SETTINGS.messages.processing_delay)
+        if tg_logs:
+            tg_logs.error(
+                f"⚠️ <b>Лот не привязан к аккаунтам</b>\n"
+                f"∟ Заказ: <code>{order_id[:20]}</code>\n"
+                f"∟ Лот: <code>#{lot_id}</code>\n"
+                f"∟ Что делать: привяжите лот к аккаунтам в разделе «🔗 Лоты»"
+            )
+        return
+    quantity = max(1, int(getattr(order, 'amount', 1) or 1))
+    hours = (lot_cfg.hours if lot_cfg.hours > 0 else 24) * quantity
     buyer = getattr(order, 'buyer_username', None) or getattr(order, 'buyer', 'Unknown')
     buyer_id = getattr(order, 'buyer_id', 0) or 0
     chat_id = getattr(order, 'chat_id', None) or getattr(order, 'node_id', 0)
     if SETTINGS.auto_extend:
+        auto_extended_msg = None
         with _data_lock:
-            existing = AccountRepo.find_active_by_buyer(buyer_id, tag)
+            existing = AccountRepo.find_active_by_buyer(
+                buyer_id, account_ids, chat_id=chat_id, buyer_name=buyer)
             if existing and order_id not in ORDERS:
                 acc = AccountRepo.get(existing.acc_id)
                 if acc and acc.rental_end:
-                    from datetime import timedelta
                     acc.rental_end = _fmt(_parse(acc.rental_end) + timedelta(hours=hours))
+                    acc.rent_hours = (acc.rent_hours or 0) + hours
+                    acc.current_order = order_id
                     ne = acc.rental_end
                     _save_accounts()
                     ORDERS[order_id] = RentOrder(
                         id=order_id, chat_id=chat_id, buyer=buyer, buyer_id=buyer_id,
-                        acc_id=acc.id, acc_login=acc.login, acc_tag=_ntag(acc.tag),
+                        acc_id=acc.id, acc_login=acc.login,
                         hours=float(hours), status=RentStatus.ACTIVE,
                         is_extension=True, lot_id=lot_id)
                     _save_orders()
-                    _send_fp(c, chat_id, _tmpl(SETTINGS.messages.auto_extended,
-                                               hours=str(hours), end_time=ne))
-                    return
-    acc = AccountRepo.claim_free(tag, hours, order_id, buyer, buyer_id, chat_id)
+                    auto_extended_msg = _tmpl(SETTINGS.messages.auto_extended,
+                                              hours=str(hours), end_time=ne)
+                elif acc:
+                    acc.rent_hours = (acc.rent_hours or 0) + hours
+                    acc.current_order = order_id
+                    _save_accounts()
+                    ORDERS[order_id] = RentOrder(
+                        id=order_id, chat_id=chat_id, buyer=buyer, buyer_id=buyer_id,
+                        acc_id=acc.id, acc_login=acc.login,
+                        hours=float(hours), status=RentStatus.BUSY,
+                        is_extension=True, lot_id=lot_id)
+                    _save_orders()
+                    auto_extended_msg = _tmpl(SETTINGS.messages.auto_extended,
+                                              hours=str(hours), end_time="аренда ещё не началась")
+        if auto_extended_msg is not None:
+            _send_fp(c, chat_id, auto_extended_msg)
+            return
+    acc = AccountRepo.claim_free(account_ids, hours, order_id, buyer, buyer_id, chat_id,
+                                  base_hours=lot_cfg.hours)
     if not acc:
+        with _data_lock:
+            ORDERS[order_id] = RentOrder(id=order_id, chat_id=chat_id, buyer=buyer, buyer_id=buyer_id,
+                                         acc_id=0, acc_login="", hours=float(hours),
+                                         status=RentStatus.ERROR, lot_id=lot_id)
+            _save_orders()
         if SETTINGS.autoback_on_error:
             _send_fp(c, chat_id, SETTINGS.messages.no_accounts)
             if _do_refund(c, order_id):
                 _send_fp(c, chat_id, SETTINGS.messages.refunded)
                 if tg_logs:
-                    tg_logs.refund(order_id, f"Нет аккаунтов (тег: {tag})")
+                    tg_logs.refund(order_id, f"Нет свободных аккаунтов (лот #{lot_id})")
         else:
-            logger.warning(f"[AutoSteamRent] Нет свободных аккаунтов для заказа {order_id} (тег: {tag}), autoback выключен")
+            logger.warning(f"[AutoSteamRent] Нет свободных аккаунтов для заказа {order_id} (лот #{lot_id}), autoback выключен")
+            _send_fp(c, chat_id, SETTINGS.messages.processing_delay)
             if tg_logs:
-                tg_logs.error(f"Нет аккаунтов для заказа #{order_id[:12]} (тег: {tag}), возврат не выполнен")
-        if SETTINGS.auto_disable_lots:
-            def _auto_disable(c=c, tag=tag):
-                toggled = _toggle_fp_lots_for_tag(c, tag, False)
-                if toggled and tg_logs:
-                    tg_logs.lots_auto_disabled(tag, toggled)
-            threading.Thread(target=_auto_disable, daemon=True).start()
+                tg_logs.error(
+                    f"📭 <b>Нет свободных аккаунтов</b>\n"
+                    f"∟ Заказ: <code>{order_id[:20]}</code>\n"
+                    f"∟ Лот: <code>#{lot_id}</code>\n"
+                    f"∟ Возврат: выключен — покупатель не получил средства обратно\n"
+                    f"∟ Что делать: добавьте/освободите аккаунт или включите авто-возврат"
+                )
+        def _auto_disable(c=c, aids=account_ids):
+            for aid in aids:
+                enabled, disabled = _resync_lots_for_account(c, aid)
+                if disabled and tg_logs:
+                    tg_logs.lots_auto_disabled(f"Аккаунт: <code>#{aid}</code>", disabled)
+        threading.Thread(target=_auto_disable, daemon=True).start()
         return
     with _data_lock:
         ro = RentOrder(id=order_id, chat_id=chat_id, buyer=buyer, buyer_id=buyer_id,
-                       acc_id=acc.id, acc_login=acc.login, acc_tag=_ntag(acc.tag),
+                       acc_id=acc.id, acc_login=acc.login,
                        hours=float(hours), lot_id=lot_id)
         ORDERS[order_id] = ro
         _save_orders()
     _send_fp(c, chat_id, _tmpl(SETTINGS.messages.order_completed,
                                 login=acc.login, password=acc.password, id=order_id,
-                                rent_period=_period_label(hours)))
+                                rent_period=_period_label(hours),
+                                end_time=acc.rental_end or "—",
+                                buyer=buyer, hours=str(hours)))
     if tg_logs:
         tg_logs.order_completed(ro, acc.login)
-    if SETTINGS.auto_disable_lots:
-        remaining = AccountRepo.count_free(tag).get(_ntag(tag), 0)
-        if remaining == 0:
-            def _auto_disable_after(c=c, tag=tag):
-                toggled = _toggle_fp_lots_for_tag(c, tag, False)
-                if toggled and tg_logs:
-                    tg_logs.lots_auto_disabled(tag, toggled)
-            threading.Thread(target=_auto_disable_after, daemon=True).start()
+    def _auto_disable_after(c=c, aid=acc.id):
+        enabled, disabled = _resync_lots_for_account(c, aid)
+        if disabled and tg_logs:
+            tg_logs.lots_auto_disabled(f"Аккаунт: <code>#{aid}</code>", disabled)
+    threading.Thread(target=_auto_disable_after, daemon=True).start()
 
 def process_message(c, event):
     if not SETTINGS or not SETTINGS.enabled:
@@ -2101,9 +2601,27 @@ def process_message(c, event):
     msg = event.message
     if not msg or not msg.text:
         return
+    msg_key = f"{msg.chat_id}:{getattr(msg, 'id', None)}"
+    if getattr(msg, 'id', None) is not None:
+        with _processed_msg_lock:
+            if msg_key in _processed_messages:
+                return
+            _processed_messages.add(msg_key)
+            if len(_processed_messages) > MAX_PROCESSED_IDS:
+                _processed_messages.clear()
     if msg.author_id == 0:
-        if msg.type == MessageTypes.NEW_FEEDBACK:
+        if msg.type in (MessageTypes.NEW_FEEDBACK, MessageTypes.FEEDBACK_CHANGED):
             _handle_feedback(c, msg)
+        else:
+            try:
+                from FunPayAPI.common.utils import RegularExpressions
+                oids = RegularExpressions().ORDER_ID.findall(msg.text or "")
+                t = msg.text or ""
+                if oids and any(kw in t for kw in ("написал отзыв", "has given feedback",
+                                                     "изменил отзыв", "has edited")):
+                    _handle_feedback(c, msg)
+            except Exception:
+                pass
         return
     fl = msg.text.strip().split('\n', 1)[0].strip().lower()
     is_code = fl in _CMD_CODE
@@ -2115,12 +2633,12 @@ def process_message(c, event):
     author_name = getattr(msg, 'author', None) or getattr(msg, 'author_username', None)
     author_id = getattr(msg, 'author_id', None) or 0
     if is_stock:
-        tag = AccountRepo.find_tag_by_chat(msg.chat_id, author_id, author_name)
-        _send_fp(c, msg.chat_id, _build_stock_message(tag))
+        _send_fp(c, msg.chat_id, _build_stock_message())
         return
     order = AccountRepo.find_order_by_chat(msg.chat_id, author_id, author_name)
     if not order:
-        _send_fp(c, msg.chat_id, SETTINGS.messages.no_order)
+        if AccountRepo.has_any_history(msg.chat_id, author_id, author_name):
+            _send_fp(c, msg.chat_id, SETTINGS.messages.no_order)
         return
     acc = AccountRepo.get(order.acc_id)
     if not acc:
@@ -2152,8 +2670,15 @@ def process_message(c, event):
             if acc_after:
                 order.update(status=RentStatus.ACTIVE)
                 acc = acc_after
-        _send_fp(c, msg.chat_id, _tmpl(SETTINGS.messages.guard_code,
-                                        code=code, end_time=acc.rental_end or "?"))
+        text = _tmpl(SETTINGS.messages.guard_code,
+                     code=code, end_time=acc.rental_end or "?", login=acc.login)
+        remaining_busy = sum(
+            1 for o in ORDERS.values()
+            if o.status == RentStatus.BUSY and str(o.chat_id or "") == str(msg.chat_id)
+        )
+        if remaining_busy:
+            text += f"\n\n⚠️ Ещё {remaining_busy} аккаунт(а) ждут активации — отправьте !code снова"
+        _send_fp(c, msg.chat_id, text)
         with _data_lock:
             acc.access_count += 1
             _save_accounts()
@@ -2183,19 +2708,77 @@ def _handle_feedback(c, message):
         return
     if not oids:
         return
-    oid = oids[0].replace("#", "")
+    for raw_oid in oids:
+        _handle_feedback_for_order(c, raw_oid.replace("#", ""))
+
+def _cumulative_rent_hours(order: "RentOrder") -> float:
+    acc = AccountRepo.get(order.acc_id)
+    if not acc or not acc.rental_start:
+        return order.hours
+    with _data_lock:
+        orders_snapshot = list(ORDERS.values())
+    total = 0.0
+    for o in orders_snapshot:
+        if o.acc_id != order.acc_id or o.created_at < acc.rental_start:
+            continue
+        same_buyer = (order.buyer_id > 0 and o.buyer_id == order.buyer_id) or (
+            order.buyer_id <= 0 and o.buyer and (o.buyer or "").strip().lower() == (order.buyer or "").strip().lower()
+        )
+        if same_buyer:
+            total += o.hours
+    return total if total > 0 else order.hours
+
+def _handle_feedback_for_order(c, oid: str):
     order = ORDERS.get(oid)
     if not order or order.review_claimed:
         return
-    bonus = SETTINGS.get_bonus_for_hours(order.hours)
+    bonus = SETTINGS.get_bonus_for_hours(_cumulative_rent_hours(order))
     if bonus > 0:
-        ne = AccountRepo.extend_rent(order.acc_id, bonus)
-        if ne:
-            order.update(review_claimed=True)
-            _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.bonus, hours=str(bonus)))
+        min_stars = SETTINGS.bonus_min_stars
+        if min_stars > 0:
+            try:
+                full = c.account.get_order(oid)
+                stars = full.review.stars if full and full.review else None
+            except Exception as e:
+                logger.debug(f"[AutoSteamRent] Бонус за отзыв #{oid}: не удалось получить рейтинг отзыва: {e}")
+                return
+            if stars is None or stars < min_stars:
+                logger.info(
+                    f"[AutoSteamRent] Бонус за отзыв #{oid}: рейтинг {stars} < {min_stars} — бонус не начисляется"
+                )
+                return
+        with _recovering_lock:
+            in_recovery = order.acc_id in _recovering_accounts
+        if in_recovery:
+            logger.info(f"[AutoSteamRent] Бонус за отзыв #{oid}: аккаунт в recovery, пропускаем")
+            return
+        acc = AccountRepo.get(order.acc_id)
+        if not acc or acc.status not in (RentStatus.ACTIVE, RentStatus.BUSY):
+            logger.info(f"[AutoSteamRent] Бонус за отзыв #{oid}: аккаунт уже освобождён, пропускаем")
+            return
+        same_owner = (order.buyer_id > 0 and acc.owner_id == order.buyer_id) or (
+            order.buyer_id <= 0 and acc.owner
+            and (acc.owner or "").strip().lower() == (order.buyer or "").strip().lower()
+        )
+        if not same_owner:
+            logger.info(f"[AutoSteamRent] Бонус за отзыв #{oid}: аккаунт уже переиспользован другим покупателем, пропускаем")
+            return
+        if acc.rental_end:
+            ne = AccountRepo.extend_rent(order.acc_id, bonus)
+            if ne:
+                order.update(review_claimed=True)
+                _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.bonus, hours=str(bonus)))
+        elif acc.status == RentStatus.BUSY:
+            if AccountRepo.add_pending_hours(order.acc_id, bonus):
+                order.update(review_claimed=True)
+                logger.info(
+                    f"[AutoSteamRent] Бонус за отзыв #{oid}: аренда ещё не начата (нет !code), "
+                    f"+{bonus}ч добавлены в rent_hours — применятся при первом !code"
+                )
+                _send_fp(c, order.chat_id, _tmpl(SETTINGS.messages.bonus, hours=str(bonus)))
 
 def process_order_status_changed(c, event):
-    if not SETTINGS.enabled or event.order.status not in (OrderStatuses.CLOSED, OrderStatuses.REFUNDED):
+    if not SETTINGS or not SETTINGS.enabled or event.order.status not in (OrderStatuses.CLOSED, OrderStatuses.REFUNDED):
         return
     order = ORDERS.get(event.order.id)
     if not order or order.status in (RentStatus.FINISHED, RentStatus.REFUND):
@@ -2215,16 +2798,52 @@ def process_order_status_changed(c, event):
                         _recovering_accounts.discard(a.id)
             threading.Thread(target=_do_refund_recover, daemon=True).start()
     elif event.order.status == OrderStatuses.CLOSED:
-        if order.status == RentStatus.BUSY:
-            acc = AccountRepo.by_order(event.order.id) or AccountRepo.get(order.acc_id)
-            if acc:
-                threading.Thread(
-                    target=_recover_account, args=(c, acc, order, "CLOSED_EARLY"), daemon=True
-                ).start()
+        if order.status == RentStatus.ACTIVE:
+            acc = AccountRepo.get(order.acc_id)
+            if acc and acc.rental_end and (_parse(acc.rental_end) - _now()).total_seconds() > 0:
+                order.update(status=RentStatus.FINISHED)
                 return
+            acc = AccountRepo.by_order(event.order.id)
+            if acc is None:
+                order.update(status=RentStatus.FINISHED)
+                return
+            with _recovering_lock:
+                if acc.id in _recovering_accounts:
+                    return
+                _recovering_accounts.add(acc.id)
+            def _do_closed_recover(a=acc, o=order):
+                try:
+                    _recover_account(c, a, o, "CLOSED_CONFIRMED")
+                finally:
+                    with _recovering_lock:
+                        _recovering_accounts.discard(a.id)
+            threading.Thread(target=_do_closed_recover, daemon=True).start()
+            return
+        if order.status == RentStatus.BUSY:
+            acc = AccountRepo.by_order(event.order.id)
+            if acc is None:
+                order.update(status=RentStatus.FINISHED)
+                return
+            with _recovering_lock:
+                if acc.id in _recovering_accounts:
+                    return
+                _recovering_accounts.add(acc.id)
+            def _do_busy_recover(a=acc, o=order):
+                try:
+                    _recover_account(c, a, o, "CLOSED_EARLY")
+                finally:
+                    with _recovering_lock:
+                        _recovering_accounts.discard(a.id)
+            threading.Thread(target=_do_busy_recover, daemon=True).start()
+            return
         order.update(status=RentStatus.FINISHED)
 
 _recovering_accounts: Set[int] = set()
+_pwd_warn_cooldown: Dict[str, float] = {}
+_PWD_WARN_INTERVAL = 3600.0
+
+_pwd_retry_cooldown: Dict[int, float] = {}
+_PWD_RETRY_COOLDOWN = 1800.0
 
 _recovering_lock = threading.Lock()
 
@@ -2243,12 +2862,77 @@ def rental_check_loop(c):
                     acc_order_id = acc.current_order
                     acc_rental_end = acc.rental_end
                     acc_id = acc.id
+                if acc_status == RentStatus.ERROR:
+                    with _data_lock:
+                        acc_obj = AccountRepo.get(acc_id)
+                    if (acc_obj and not acc_obj.error_permanent
+                            and time.time() >= _pwd_retry_cooldown.get(acc_id, 0)):
+                        with _recovering_lock:
+                            if acc_id not in _recovering_accounts:
+                                _recovering_accounts.add(acc_id)
+                                def _do_auto_reset(a=acc_obj):
+                                    try:
+                                        np = change_password_sync(a.mafile, a.password, a.id, proxy=SETTINGS.pwd_change_proxy)
+                                        AccountRepo.release(a.id, np)
+                                        logger.info(f"[AutoSteamRent] Авто-сброс ERROR→FREE: {a.login}")
+                                        if tg_logs:
+                                            tg_logs.error(
+                                            f"✅ <b>Аккаунт восстановлен</b>\n"
+                                            f"∟ Аккаунт: <code>{a.login}</code>\n"
+                                            f"∟ Пароль сменён со второй попытки\n"
+                                            f"∟ Статус: 🟢 Свободен — снова доступен для аренды"
+                                        )
+                                    except Exception as _e:
+                                        logger.warning(f"[AutoSteamRent] Авто-сброс {a.login} не удался: {_e}")
+                                        AccountRepo.release(a.id, error=True, permanent=True)
+                                        if tg_logs:
+                                            tg_logs.error(
+                                                f"🔑 <b>Не удалось сменить пароль (повторная попытка)</b>\n"
+                                                f"∟ Аккаунт: <code>{a.login}</code>\n"
+                                                f"∟ Ошибка: {_safe_err(_e)}\n"
+                                                f"∟ Статус: ❌ ERROR — автоматически больше не пробуем\n"
+                                                f"∟ Что делать: смените пароль вручную в меню аккаунта и обновите его в боте"
+                                            )
+                                    finally:
+                                        with _recovering_lock:
+                                            _recovering_accounts.discard(a.id)
+                                threading.Thread(target=_do_auto_reset, daemon=True).start()
+                    continue
+
                 if acc_status not in (RentStatus.ACTIVE, RentStatus.BUSY) or not acc_order_id:
                     continue
                 order = ORDERS.get(acc_order_id)
                 if not order:
                     AccountRepo.release(acc_id)
                     continue
+
+                if (acc_status == RentStatus.BUSY and SETTINGS.autoback_on_error
+                        and order.chat_id and not order.is_extension):
+                    age_min = (_now() - _parse(order.created_at)).total_seconds() / 60
+                    if age_min >= SETTINGS.no_code_timeout:
+                        with _recovering_lock:
+                            if acc_id not in _recovering_accounts:
+                                _recovering_accounts.add(acc_id)
+                                def _do_no_code_refund(a=acc, o=order):
+                                    try:
+                                        AccountRepo.release(a.id)
+                                        if SETTINGS.autoback_on_error:
+                                            _send_fp(c, o.chat_id, SETTINGS.messages.no_code_refund)
+                                            if _do_refund(c, o.id):
+                                                o.update(status=RentStatus.REFUND)
+                                                if tg_logs:
+                                                    tg_logs.refund(o.id, "Нет !code в срок")
+                                            else:
+                                                o.update(status=RentStatus.FINISHED)
+                                        else:
+                                            o.update(status=RentStatus.FINISHED)
+                                        logger.info(f"[AutoSteamRent] Авто-возврат (нет !code): {o.id}")
+                                    finally:
+                                        with _recovering_lock:
+                                            _recovering_accounts.discard(a.id)
+                                threading.Thread(target=_do_no_code_refund, daemon=True).start()
+                        continue
+
                 if acc_rental_end:
                     rem = (_parse(acc_rental_end) - now).total_seconds()
                     if 0 < rem < 600 and not order.warned:
@@ -2293,12 +2977,18 @@ class CBT:
     ACC_LIST = "asr_lst"
     ACC_DETAIL = "asr_det"
     ACC_CODE = "asr_code"
+    ACC_CODE_SEND = "asr_codesend"
     ACC_STOP = "asr_stop"
     ACC_CHPWD = "asr_chpwd"
+    ACC_CHPWD_YES = "asr_chpwdyes"
+    ACC_CHPWD_NO = "asr_chpwdno"
     ACC_EXTEND = "asr_ext"
     ACC_EXTEND_DO = "asr_extdo"
+    ACC_EXTEND_CUSTOM = "asr_extcst"
     ACC_MANUAL = "asr_man"
     ACC_MANUAL_HOURS = "asr_manhr"
+    ACC_MANUAL_CUSTOM = "asr_mancst"
+    ACC_MANUAL_YES = "asr_manyes"
     ACC_EDIT_HOURS = "asr_ehrs"
     ACC_TOGGLE_HOUR = "asr_thrs"
     ACC_SAVE_HOURS = "asr_shrs"
@@ -2308,24 +2998,36 @@ class CBT:
     LOTS = "asr_lots"
     LOT_ADD = "asr_ladd"
     LOT_TAG = "asr_ltag"
+    LOT_ACC_DONE = "asr_ladone"
     LOT_HRS = "asr_lhrs"
     LOT_DETAIL = "asr_ldet"
     LOT_EDIT = "asr_ledt"
     LOT_EDIT_TAG = "asr_letag"
+    LOT_EDIT_ACC_DONE = "asr_leadone"
     LOT_EDIT_HRS = "asr_lehrs"
     LOT_RENAME = "asr_lren"
     LOT_DEL_CONFIRM = "asr_ldlcf"
     LOT_DEL_YES = "asr_ldlyes"
     LOT_DEL_NO = "asr_ldlno"
+    LOT_HRS_CUSTOM = "asr_lhrsc"
+    LOT_EDIT_HRS_CUSTOM = "asr_lehrsc"
+    ACC_HRS_CUSTOM = "asr_ahrsc"
     LOT_TOGGLE_FP = "asr_ltglfp"
     LOTS_DISABLE_ALL = "asr_ldisall"
     LOTS_ENABLE_ALL = "asr_lenall"
     LOTS_SETTINGS = "asr_lsets"
     REVS = "asr_revs"
     REV_ADD = "asr_radd"
+    REV_DETAIL = "asr_rdet"
+    REV_EDIT = "asr_redt"
     REV_DEL = "asr_rdel"
+    REV_DEL_YES = "asr_rdely"
+    REV_DEL_NO = "asr_rdeln"
     REV_HRS = "asr_rhrs"
     REV_BON = "asr_rbon"
+    REV_BON_CUSTOM = "asr_rboncst"
+    REV_MINSTARS = "asr_rminst"
+    REV_MINSTARS_SET = "asr_rminstset"
     NOTIFS = "asr_ntf"
     MSGS = "asr_msgs"
     MSG_EDIT = "asr_medt"
@@ -2336,20 +3038,28 @@ class CBT:
     TOGGLE = "asr_tgl"
     FILES = "asr_files"
     FILES_CONFIRM = "asr_files_yes"
+    PROXY = "asr_proxy"
+    PROXY_CLR = "asr_proxyclr"
     HRS_TGL = "asr_htgl"
     HRS_DONE = "asr_hdone"
 
 class States:
     LOGIN = "ASR_LOGIN"
     PASS = "ASR_PASS"
-    TAG = "ASR_TAG"
     MAFILE = "ASR_MAFILE"
     MAN_BUYER = "ASR_MAN_BUYER"
+    MAN_HRS_CUSTOM = "ASR_MAN_HRS_CUSTOM"
+    REV_BON_CUSTOM = "ASR_REV_BON_CUSTOM"
+    ACC_EXTEND_CUSTOM = "ASR_ACC_EXTEND_CUSTOM"
     LOT_ID = "ASR_LOT_ID"
     LOT_RENAME = "ASR_LOT_RENAME"
     MSG_EDIT = "ASR_MSG_EDIT"
     SET_PWD = "ASR_SET_PWD"
     EDIT_MAFILE = "ASR_MAFILE_EDIT"
+    LOT_HRS_CUSTOM = "ASR_LOT_HRS_CUSTOM"
+    LOT_EDIT_HRS_CUSTOM = "ASR_LOT_EDIT_HRS_CUSTOM"
+    ACC_HRS_CUSTOM = "ASR_ACC_HRS_CUSTOM"
+    PROXY = "ASR_PROXY"
 
 def _startup_diagnostics():
     issues = []
@@ -2364,13 +3074,16 @@ def _startup_diagnostics():
             issues.append(f"Нет device_id/SteamID (смена пароля недоступна): {', '.join(bad_pwd[:3])}")
     if not SETTINGS.lots:
         issues.append("Лоты не настроены")
-    try:
-        from playwright.sync_api import sync_playwright as _spw
-        with _spw() as _p:
-            if not os.path.exists(_p.chromium.executable_path):
-                issues.append("Chromium не установлен — смена пароля может не работать")
-    except Exception as e:
-        issues.append(f"Playwright недоступен: {e} — смена пароля может не работать")
+    if _chromium_ready.is_set():
+        try:
+            from playwright.sync_api import sync_playwright as _spw
+            with _spw() as _p:
+                if not os.path.exists(_p.chromium.executable_path):
+                    issues.append("Chromium не установлен — смена пароля не будет работать")
+        except Exception as e:
+            issues.append(f"Playwright недоступен: {e} — смена пароля не будет работать")
+    else:
+        logger.info("[AutoSteamRent] Chromium устанавливается в фоне — пропускаем проверку")
     if issues:
         logger.warning("[AutoSteamRent] Диагностика при старте:\n" +
                        "\n".join(f"  ⚠️ {i}" for i in issues))
@@ -2379,6 +3092,7 @@ def _startup_diagnostics():
 
 def init(card: Cardinal):
     global cardinal_ref, tg_logs
+    _stop_event.clear()
     cardinal_ref = card
     tg_logs = TgLogs(card)
     SteamGuard.sync_time_sync()
@@ -2423,6 +3137,10 @@ def init(card: Cardinal):
         for h in ALL_PERIODS:
             check = "✅" if h in selected else "⬜"
             kb.add(B(f"{check} {_period_label(h)}", None, f"{toggle_cb}:{h}"))
+        custom = [h for h in selected if h not in ALL_PERIODS]
+        for h in custom:
+            kb.row(B(f"✅ {_period_label(h)} ✕", None, f"{toggle_cb}:{h}"))
+        kb.row(B("✏️ Своё время", None, CBT.ACC_HRS_CUSTOM))
         kb.add(B("✅ Готово", None, done_cb))
         kb.add(B("⬅️ Назад", None, back_cb))
         return kb
@@ -2474,18 +3192,17 @@ def init(card: Cardinal):
         kb.row(B(f"{_is_on(SETTINGS.enabled)} Авто-выдача", None, f"{CBT.TOGGLE}:enabled"))
         kb.add(B(f"{_is_on(SETTINGS.autoback_on_error)} Авто-возврат", None, f"{CBT.TOGGLE}:autoback_on_error"))
         kb.add(B(f"{_is_on(SETTINGS.auto_extend)} Авто-продление", None, f"{CBT.TOGGLE}:auto_extend"))
-        kb.add(B("📂 Аккаунты", None, CBT.ACC_MENU), B("🔗 Лоты", None, CBT.LOTS))
-        kb.add(B("⭐️ Бонусы за отзывы", None, CBT.REVS))
+        kb.add(B("📂 Аккаунты", None, CBT.ACC_MENU), B("🔗 Лоты", None, f"{CBT.LOTS}:0"))
+        kb.add(B("🎁 Бонус за отзыв", None, CBT.REVS))
         kb.row(B("🔔 Уведомления", None, CBT.NOTIFS), B("💬 Сообщения", None, CBT.MSGS))
         kb.row(B("📊 Статистика", None, CBT.STATS), B("📜 История", None, f"{CBT.HIST}:1"))
         kb.row(B("📁 Файлы", None, f"{CBT.FILES}:all"), B("⬅️ Назад", None, f"{_CBT.EDIT_PLUGIN}:{UUID}:0"))
         return kb
 
     def _acc_text(acc):
-        icon = ICON_STATUS.get(acc.status, "❓")
-        lines = [f"<b>{icon} Аккаунт #{acc.id}: {acc.login}</b>\n",
-                 f"∟ Статус: <code>{acc.status}</code>",
-                 f"∟ Тег: <code>{acc.tag}</code>",
+        status_label = STATUS_LABELS.get(acc.status, acc.status)
+        lines = [f"<b>#{acc.id} Аккаунт — {acc.login}</b>\n",
+                 f"∟ Статус: <b>{status_label}</b>",
                  f"∟ Периоды: <code>{_format_periods(acc.allowed_hours)}</code>",
                  f"∟ Пароль: <code>{acc.password}</code>"]
         if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY):
@@ -2505,8 +3222,8 @@ def init(card: Cardinal):
     def _acc_kb(acc):
         kb = K(row_width=2)
         kb.add(B("🔑 Выдать код", None, f"{CBT.ACC_CODE}:{acc.id}"),
-               B("🔄 Сменить пароль", None, f"{CBT.ACC_CHPWD}:{acc.id}"))
-        kb.add(B("✏️ Обновить пароль", None, f"{CBT.ACC_SET_PWD}:{acc.id}"),
+               B("🔄 Сменить пароль в Steam", None, f"{CBT.ACC_CHPWD}:{acc.id}"))
+        kb.add(B("✏️ Указать пароль вручную", None, f"{CBT.ACC_SET_PWD}:{acc.id}"),
                B("🗂 Обновить maFile", None, f"{CBT.ACC_EDIT_MAFILE}:{acc.id}"))
         if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY):
             kb.add(B("⏹ Остановить", None, f"{CBT.ACC_STOP}:{acc.id}"),
@@ -2545,10 +3262,14 @@ def init(card: Cardinal):
             open_main(c)
 
     def open_acc_menu(c):
+        tg.clear_state(c.message.chat.id, c.from_user.id, False)
         kb = K()
         kb.add(B("➕ Добавить аккаунт", None, CBT.ACC_ADD))
         if ACCOUNTS:
             kb.add(B("📜 Список аккаунтов", None, f"{CBT.ACC_LIST}:0"))
+        _p_val = SETTINGS.pwd_change_proxy
+        _p_label = "🌐 Прокси: " + ("задан" if _p_val else "не задан")
+        kb.add(B(_p_label, None, CBT.PROXY))
         kb.add(B("⬅️ Назад", None, CBT.MAIN))
         edit(c.message, "<b>📂 Управление аккаунтами</b>", kb)
 
@@ -2560,9 +3281,9 @@ def init(card: Cardinal):
         pg = max(0, min(pg, tp - 1))
         start, end = pg * PAGE_SIZE, (pg + 1) * PAGE_SIZE
         for acc in ACCOUNTS[start:end]:
-            icon = ICON_STATUS.get(acc.status, "❓")
-            owner = f' | {acc.owner}' if acc.owner else ''
-            kb.add(B(f"{icon} {acc.login} [{acc.tag}] {_format_periods(acc.allowed_hours)}{owner}",
+            status_label = STATUS_LABELS.get(acc.status, acc.status).lower()
+            owner = f" ({acc.owner})" if acc.owner else ""
+            kb.add(B(f"{acc.login} — {status_label}{owner}",
                      None, f"{CBT.ACC_DETAIL}:{acc.id}"))
         nav = []
         if pg > 0:
@@ -2591,7 +3312,6 @@ def init(card: Cardinal):
         text = (
             f"⚠️ <b>Удалить аккаунт?</b>\n\n"
             f"∟ Логин: <code>{acc.login}</code>\n"
-            f"∟ Тег: <code>{acc.tag}</code>\n"
             f"∟ Статус: <code>{acc.status}</code>\n\n"
             f"❗ Это действие необратимо!"
         )
@@ -2627,21 +3347,34 @@ def init(card: Cardinal):
         code = SteamGuard.code_sync(ss)
         if code in ("ERROR", "NO_SECRET"):
             return answer(c, "❌ Ошибка генерации", True)
-        if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY) and acc.owner_chat_id:
-            _send_fp(card, acc.owner_chat_id,
-                     _tmpl(SETTINGS.messages.guard_code, code=code, end_time=acc.rental_end or "?"))
         kb = K(row_width=2)
+        can_send = acc.status in (RentStatus.ACTIVE, RentStatus.BUSY) and acc.owner_chat_id
         kb.add(B("🔄 Новый код", None, f"{CBT.ACC_CODE}:{acc.id}"),
                B("⬅️ К аккаунту", None, f"{CBT.ACC_DETAIL}:{acc.id}"))
+        if can_send:
+            kb.add(B("📤 Отправить покупателю", None, f"{CBT.ACC_CODE_SEND}:{acc.id}:{code}"))
+        note = "" if can_send else "\n\n<i>Отправка недоступна: сейчас нет активной аренды с этим аккаунтом</i>"
         edit(c.message, f"🔑 <b>Steam Guard код</b>\n\n∟ Аккаунт: <code>{acc.login}</code>\n"
-                        f"∟ Код: <code>{code}</code>\n∟ Действителен ~30 сек", kb)
+                        f"∟ Код: <code>{code}</code>\n∟ Действителен ~30 сек{note}", kb)
+
+    def acc_code_send(c):
+        parts = c.data.split(":")
+        acc_id, code = int(parts[1]), parts[2]
+        acc = AccountRepo.get(acc_id)
+        if not acc:
+            return answer(c, "❌ Не найден", True)
+        if not (acc.status in (RentStatus.ACTIVE, RentStatus.BUSY) and acc.owner_chat_id):
+            return answer(c, "❌ Нет активного арендатора", True)
+        _send_fp(card, acc.owner_chat_id,
+                 _tmpl(SETTINGS.messages.guard_code, code=code, login=acc.login, end_time=acc.rental_end or "?"))
+        answer(c, "✅ Отправлено покупателю")
 
     def acc_stop(c):
         acc = AccountRepo.get(_pid(c))
         if not acc:
             return answer(c, "❌ Не найден", True)
         if acc.status not in (RentStatus.ACTIVE, RentStatus.BUSY):
-            return answer(c, "ℹ️ Не активна", True)
+            return answer(c, "ℹ️ Аренда не активна, останавливать нечего", True)
         with _recovering_lock:
             if acc.id in _recovering_accounts:
                 return answer(c, "⏳ Уже идёт остановка", True)
@@ -2656,7 +3389,8 @@ def init(card: Cardinal):
                 if a:
                     _recover_account(card, a, order, "MANUAL_STOP")
                     if owner_chat_id:
-                        _send_fp(card, owner_chat_id, SETTINGS.messages.rent_over)
+                        _send_fp(card, owner_chat_id, _tmpl(SETTINGS.messages.rent_over,
+                                                             id=a.current_order or "", login=a.login, buyer=a.owner or ""))
                     send(chat_id, f"✅ Аренда <code>{a.login}</code> остановлена.")
             except Exception as e:
                 send(chat_id, f"❌ Ошибка остановки: {_safe_err(e)}")
@@ -2667,38 +3401,110 @@ def init(card: Cardinal):
         edit(c.message, f"⏳ Остановка <code>{acc.login}</code>...", _back_kb(f"{CBT.ACC_DETAIL}:{acc.id}"))
         threading.Thread(target=_do, daemon=True).start()
 
-    def acc_chpwd(c):
-        acc = AccountRepo.get(_pid(c))
-        if not acc:
-            return answer(c, "❌ Не найден", True)
+    def _run_chpwd(c, acc_id):
         chat_id = c.message.chat.id
-        acc_id = acc.id
+        with _recovering_lock:
+            if acc_id in _recovering_accounts:
+                edit(c.message,
+                     "⏳ Бот уже меняет пароль этого аккаунта в фоне (автоматически) — "
+                     "дождитесь результата, повторный запуск сейчас не нужен.",
+                     _back_kb(f"{CBT.ACC_DETAIL}:{acc_id}"))
+                return
+            _recovering_accounts.add(acc_id)
         def _do():
+            a = None
             try:
                 a = AccountRepo.get(acc_id)
                 if not a:
                     send(chat_id, "❌ Аккаунт не найден")
                     return
-                np = change_password_sync(a.mafile, a.password, a.id)
+                np = change_password_sync(a.mafile, a.password, a.id, proxy=SETTINGS.pwd_change_proxy)
                 with _data_lock:
                     a.password = np
                     _save_accounts()
-                send(chat_id, f"✅ Пароль <code>{a.login}</code> изменён:\n<code>{np}</code>")
+                send(chat_id,
+                     f"✅ <b>Пароль изменён</b>\n"
+                     f"∟ Аккаунт: <code>{a.login}</code>\n"
+                     f"∟ Новый пароль: <code>{np}</code>")
             except Exception as e:
-                send(chat_id, f"❌ Ошибка: {_safe_err(e)}")
-        answer(c)
-        edit(c.message, f"⏳ Смена пароля <code>{acc.login}</code>...", _back_kb(f"{CBT.ACC_DETAIL}:{acc.id}"))
+                send(chat_id,
+                     f"❌ <b>Не удалось сменить пароль</b>\n"
+                     f"∟ Аккаунт: <code>{a.login if a else acc_id}</code>\n"
+                     f"∟ Причина: {_safe_err(e)}\n"
+                     f"∟ Что делать: {_pwd_error_hint(e)}")
+            finally:
+                with _recovering_lock:
+                    _recovering_accounts.discard(acc_id)
+        acc = AccountRepo.get(acc_id)
+        edit(c.message,
+             f"⏳ Меняю пароль аккаунта <code>{acc.login if acc else acc_id}</code>…\n∟ Обычно занимает 10–20 секунд",
+             _back_kb(f"{CBT.ACC_DETAIL}:{acc_id}"))
         threading.Thread(target=_do, daemon=True).start()
+
+    def acc_chpwd(c):
+        acc = AccountRepo.get(_pid(c))
+        if not acc:
+            return answer(c, "❌ Не найден", True)
+        if acc.status in (RentStatus.ACTIVE, RentStatus.BUSY):
+            answer(c)
+            owner = acc.owner or "покупатель не указан"
+            text = (
+                f"⚠️ <b>Сменить пароль во время активной аренды?</b>\n\n"
+                f"∟ Аккаунт: <code>{acc.login}</code>\n"
+                f"∟ Арендатор: <code>{owner}</code>\n\n"
+                f"❗ Покупатель сразу потеряет доступ к аккаунту, заказ при этом останется открытым."
+            )
+            kb = K(row_width=2)
+            kb.add(
+                B("✅ Да, сменить", None, f"{CBT.ACC_CHPWD_YES}:{acc.id}"),
+                B("❌ Отмена", None, f"{CBT.ACC_CHPWD_NO}:{acc.id}")
+            )
+            return edit(c.message, text, kb)
+        answer(c)
+        _run_chpwd(c, acc.id)
+
+    def acc_chpwd_yes(c):
+        acc_id = _pid(c)
+        answer(c)
+        _run_chpwd(c, acc_id)
+
+    def acc_chpwd_no(c):
+        aid = _pid(c)
+        answer(c, "❌ Смена пароля отменена")
+        c.data = f"{CBT.ACC_DETAIL}:{aid}"
+        open_acc_detail(c)
+
+    def _extend_kb(aid, back_cb):
+        kb = K(row_width=3)
+        for h in ALL_PERIODS:
+            kb.add(B(f"+{_period_label(h)}", None, f"{CBT.ACC_EXTEND_DO}:{aid}:{h}"))
+        kb.row(B("✏️ Своё время", None, f"{CBT.ACC_EXTEND_CUSTOM}:{aid}"))
+        kb.add(B("⬅️ Назад", None, back_cb))
+        return kb
+
+    def _do_extend(acc, h) -> str:
+        if acc.status == RentStatus.ACTIVE and acc.rental_end:
+            ne = AccountRepo.extend_rent(acc.id, h)
+            if acc.owner_chat_id:
+                _send_fp(card, acc.owner_chat_id, _tmpl(SETTINGS.messages.extended, hours=str(h), end_time=ne))
+            return f"✅ <code>{acc.login}</code> +{_period_label(h)}\n∟ Окончание: <code>{ne}</code>"
+        if acc.status == RentStatus.BUSY:
+            AccountRepo.add_pending_hours(acc.id, h)
+            return (f"✅ <code>{acc.login}</code> +{_period_label(h)} добавлено к ожидающей аренде\n"
+                    f"∟ Покупатель ещё не запросил !code — часы применятся, когда аренда начнётся")
+        return "❌ Аренда не активна, продлевать нечего"
 
     def acc_extend_menu(c):
         acc = AccountRepo.get(_pid(c))
         if not acc:
             return answer(c, "❌ Не найден", True)
-        kb = K(row_width=3)
-        for h in [1, 2, 3, 6, 12, 24]:
-            kb.add(B(f"+{h}ч", None, f"{CBT.ACC_EXTEND_DO}:{acc.id}:{h}"))
-        kb.add(B("⬅️", None, f"{CBT.ACC_DETAIL}:{acc.id}"))
-        edit(c.message, f"⏰ Продлить <code>{acc.login}</code>:", kb)
+        answer(c)
+        note = ""
+        if acc.status == RentStatus.BUSY:
+            note = ("\n\n<i>Аренда ещё не началась — покупатель не запросил !code. Продление добавится "
+                    "к времени, которое включится при первом коде.</i>")
+        edit(c.message, f"⏰ Продлить <code>{acc.login}</code>:{note}",
+             _extend_kb(acc.id, f"{CBT.ACC_DETAIL}:{acc.id}"))
 
     def acc_extend_do(c):
         try:
@@ -2706,15 +3512,41 @@ def init(card: Cardinal):
             aid, h = int(parts[1]), int(parts[2])
         except (IndexError, ValueError):
             return answer(c, "❌ Неверные данные", True)
-        ne = AccountRepo.extend_rent(aid, h)
         acc = AccountRepo.get(aid)
-        if ne:
-            if acc and acc.owner_chat_id:
-                _send_fp(card, acc.owner_chat_id, _tmpl(SETTINGS.messages.extended, hours=str(h), end_time=ne))
-            edit(c.message, f"✅ <code>{acc.login if acc else aid}</code> +{h}ч\n∟ Окончание: <code>{ne}</code>",
-                 _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
-        else:
-            answer(c, "❌ Не удалось", True)
+        if not acc:
+            return answer(c, "❌ Не найден", True)
+        answer(c)
+        edit(c.message, _do_extend(acc, h), _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
+
+    def acc_extend_custom(c):
+        aid = _pid(c)
+        acc = AccountRepo.get(aid)
+        if not acc:
+            return answer(c, "❌ Не найден", True)
+        _temp_storage.setdefault(c.from_user.id, {})["ext_id"] = aid
+        answer(c)
+        _ask(c.message.chat.id, c.from_user.id,
+             States.ACC_EXTEND_CUSTOM,
+             f"Введите <b>своё время продления</b> для <code>{acc.login}</code> в часах:\n"
+             f"<i>Примеры: 5, 18, 36</i>",
+             _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
+
+    def _h_acc_extend_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        aid = _temp_storage.get(m.from_user.id, {}).get("ext_id")
+        if not aid:
+            send(m.chat.id, "❌ Данные утеряны, начните заново", _main_kb())
+            return
+        back_cb = f"{CBT.ACC_DETAIL}:{aid}"
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 18", _back_kb(back_cb))
+            return
+        acc = AccountRepo.get(aid)
+        if not acc:
+            send(m.chat.id, "❌ Не найден", _main_kb())
+            return
+        send(m.chat.id, _do_extend(acc, h), _back_kb(back_cb))
 
     def acc_reset(c):
         aid = _pid(c)
@@ -2722,8 +3554,7 @@ def init(card: Cardinal):
         if not acc:
             return answer(c, "❌ Не найден", True)
         if acc.status != RentStatus.ERROR:
-            return answer(c, "ℹ️ Не в ERROR", True)
-        acc_tag = _ntag(acc.tag)
+            return answer(c, "ℹ️ Аккаунт не в статусе ошибки, сбрасывать нечего", True)
         if acc.current_order:
             order = ORDERS.get(acc.current_order)
             if order and order.status not in (RentStatus.FINISHED, RentStatus.REFUND):
@@ -2733,10 +3564,11 @@ def init(card: Cardinal):
         acc = AccountRepo.get(aid)
         edit(c.message, _acc_text(acc), _acc_kb(acc))
         if SETTINGS.auto_enable_lots and cardinal_ref:
-            def _auto_enable_reset(tag=acc_tag):
-                toggled = _toggle_fp_lots_for_tag(cardinal_ref, tag, True)
-                if toggled and tg_logs:
-                    tg_logs.lots_auto_enabled(tag, toggled)
+            notify_chat = c.message.chat.id
+            def _auto_enable_reset(account_id=aid, notify_chat=notify_chat):
+                enabled, disabled = _resync_lots_for_account(cardinal_ref, account_id)
+                if enabled and tg_logs:
+                    tg_logs.lots_auto_enabled(f"Аккаунт: <code>#{account_id}</code>", enabled, chat_id=notify_chat)
             threading.Thread(target=_auto_enable_reset, daemon=True).start()
 
     def acc_edit_hours(c):
@@ -2783,7 +3615,10 @@ def init(card: Cardinal):
         answer(c)
         _ask(c.message.chat.id, c.from_user.id,
              States.SET_PWD,
-             f"✏️ Введите новый пароль для <code>{acc.login}</code>:",
+             f"✏️ Введите новый пароль для <code>{acc.login}</code>:\n\n"
+             f"<i>Это только запись в боте — пароль в Steam не изменится. Используйте, если вы уже "
+             f"сменили пароль сами и просто обновляете запись. Чтобы реально сменить пароль в Steam, "
+             f"используйте «🔄 Сменить пароль в Steam».</i>",
              _back_kb(f"{CBT.ACC_DETAIL}:{acc.id}"))
 
     def _h_set_pwd(m):
@@ -2882,21 +3717,76 @@ def init(card: Cardinal):
         if not acc:
             return answer(c, "❌ Не найден", True)
         if acc.status not in (RentStatus.FREE, RentStatus.ERROR):
-            return answer(c, "ℹ️ Не свободен", True)
-        _temp_storage.setdefault(c.from_user.id, {})["man_id"] = acc.id
+            return answer(c, "ℹ️ Аккаунт сейчас не свободен", True)
+        _temp_storage[c.from_user.id] = {"man_id": acc.id}
         answer(c)
         _ask(c.message.chat.id, c.from_user.id,
              States.MAN_BUYER,
              f"🤝 Ручная аренда <code>{acc.login}</code>\n\nВведите <b>ник покупателя</b>:",
              _back_kb(f"{CBT.ACC_DETAIL}:{acc.id}"))
 
-    def _h_manual_buyer(m):
-        _temp_storage.setdefault(m.from_user.id, {})["man_buyer"] = m.text.strip()
-        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+    def _manual_period_kb(back_cb):
         kb = K(row_width=3)
         for h in ALL_PERIODS:
             kb.add(B(_period_label(h), None, f"{CBT.ACC_MANUAL_HOURS}:{h}"))
-        send(m.chat.id, "Выберите <b>период</b>:", kb)
+        kb.row(B("✏️ Своё время", None, CBT.ACC_MANUAL_CUSTOM))
+        kb.add(B("⬅️ Назад", None, back_cb))
+        return kb
+
+    def _h_manual_buyer(m):
+        d = _temp_storage.setdefault(m.from_user.id, {})
+        aid = d.get("man_id")
+        back_cb = f"{CBT.ACC_DETAIL}:{aid}" if aid else CBT.ACC_MENU
+        buyer = (m.text or "").strip()
+        if not buyer or buyer.startswith("/"):
+            send(m.chat.id,
+                 "❌ Ник не может быть пустым и не должен начинаться с «/». Введите ник ещё раз:",
+                 _back_kb(back_cb))
+            return
+        d["man_buyer"] = buyer
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        send(m.chat.id, "Выберите <b>период</b>:", _manual_period_kb(back_cb))
+
+    def acc_manual_custom(c):
+        answer(c)
+        aid = _temp_storage.get(c.from_user.id, {}).get("man_id")
+        back_cb = f"{CBT.ACC_DETAIL}:{aid}" if aid else CBT.ACC_MENU
+        _ask(c.message.chat.id, c.from_user.id,
+             States.MAN_HRS_CUSTOM,
+             "Введите <b>своё время аренды</b> в часах:\n<i>Примеры: 5, 48, 120</i>",
+             _back_kb(back_cb))
+
+    def _manual_confirm_text(acc, buyer, h):
+        return (
+            f"🤝 <b>Подтвердите ручную выдачу</b>\n\n"
+            f"∟ Аккаунт: <code>{acc.login}</code>\n"
+            f"∟ Покупатель: <code>{buyer}</code>\n"
+            f"∟ Период: <code>{_period_label(h)}</code>\n\n"
+            f"⚠️ Команды !code и !time от этого покупателя работать не будут — "
+            f"код нужно будет выдавать вручную через кнопку «Выдать код»."
+        )
+
+    def _manual_confirm_kb(aid):
+        kb = K(row_width=1)
+        kb.add(B("✅ Да, выдать", None, CBT.ACC_MANUAL_YES))
+        kb.add(B("❌ Отмена", None, f"{CBT.ACC_DETAIL}:{aid}"))
+        return kb
+
+    def _h_manual_hrs_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        d = _temp_storage.get(m.from_user.id, {})
+        aid = d.get("man_id")
+        back_cb = f"{CBT.ACC_DETAIL}:{aid}" if aid else CBT.ACC_MENU
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 48", _back_kb(back_cb))
+            return
+        acc = AccountRepo.get(aid) if aid else None
+        if not acc:
+            send(m.chat.id, "❌ Данные утеряны, начните заново", _main_kb())
+            return
+        d["man_hours"] = h
+        send(m.chat.id, _manual_confirm_text(acc, d.get("man_buyer", "manual"), h), _manual_confirm_kb(aid))
 
     def handle_manual_hours(c):
         h = _pid(c)
@@ -2904,13 +3794,26 @@ def init(card: Cardinal):
         aid = d.get("man_id")
         if not aid:
             return answer(c, "❌ Начните заново", True)
+        acc = AccountRepo.get(aid)
+        if not acc:
+            return answer(c, "❌ Не найден", True)
+        d["man_hours"] = h
+        answer(c)
+        edit(c.message, _manual_confirm_text(acc, d.get("man_buyer", "manual"), h), _manual_confirm_kb(aid))
+
+    def manual_confirm_yes(c):
+        d = _temp_storage.get(c.from_user.id, {})
+        aid, h = d.get("man_id"), d.get("man_hours")
+        if not aid or not h:
+            return answer(c, "❌ Начните заново", True)
         acc = AccountRepo.manual_assign(aid, d.get("man_buyer", "manual"), h)
+        answer(c)
         if acc:
             edit(c.message, f"✅ <code>{acc.login}</code> → <code>{acc.owner}</code> на {h}ч\n"
                             f"∟ Окончание: <code>{acc.rental_end}</code>",
                  _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
         else:
-            edit(c.message, "❌ Не удалось (занят?)", _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
+            edit(c.message, "❌ Не удалось: аккаунт уже занят", _back_kb(f"{CBT.ACC_DETAIL}:{aid}"))
 
     def start_add(c):
         answer(c)
@@ -2933,19 +3836,10 @@ def init(card: Cardinal):
 
     def _h_pass(m):
         _temp_storage.setdefault(m.from_user.id, {})["password"] = m.text.strip()
-        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
-        _ask(m.chat.id, m.from_user.id,
-             States.TAG,
-             "3️⃣ Введите <b>тег</b>:",
-             _back_kb(CBT.ACC_MENU))
-
-    def _h_tag(m):
-        d = _temp_storage.setdefault(m.from_user.id, {})
-        d["tag"] = m.text.strip()
-        d["sel_hrs"] = []
+        _temp_storage[m.from_user.id]["sel_hrs"] = []
         _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
         kb = _hours_kb([], CBT.HRS_TGL, CBT.HRS_DONE, CBT.ACC_MENU)
-        msg = send(m.chat.id, "4️⃣ Выберите <b>периоды аренды</b>:", kb)
+        msg = send(m.chat.id, "3️⃣ Выберите <b>периоды аренды</b>:", kb)
         _temp_storage[m.from_user.id]["bot_msg_id"] = msg.message_id
 
     def hrs_toggle(c):
@@ -2956,7 +3850,7 @@ def init(card: Cardinal):
         else:
             sel.append(h)
         kb = _hours_kb(sel, CBT.HRS_TGL, CBT.HRS_DONE, CBT.ACC_MENU)
-        edit(c.message, "4️⃣ Выберите <b>периоды аренды</b>:", kb)
+        edit(c.message, "3️⃣ Выберите <b>периоды аренды</b>:", kb)
         answer(c)
 
     def hrs_done(c):
@@ -2969,7 +3863,7 @@ def init(card: Cardinal):
         _try_delete(c.message.chat.id, c.message.message_id)
         _ask(c.message.chat.id, c.from_user.id,
              States.MAFILE,
-             "5️⃣ Отправьте <b>.maFile</b> (файлом или JSON текстом):",
+             "4️⃣ Отправьте <b>.maFile</b> (файлом или JSON текстом):",
              _back_kb(CBT.ACC_MENU))
 
     def _h_mafile(m):
@@ -3010,7 +3904,7 @@ def init(card: Cardinal):
         mafile_login = mf.get("account_name", "").strip()
         entered_login = d["login"].strip()
         actual_login = mafile_login if mafile_login else entered_login
-        ok, txt = AccountRepo.add(actual_login, d["password"], mf, d["tag"],
+        ok, txt = AccountRepo.add(actual_login, d["password"], mf,
                                   d.get("allowed_hours", [24]))
         _invalidate_lots_cache()
         if ok:
@@ -3021,57 +3915,69 @@ def init(card: Cardinal):
             if warn:
                 extra += f"\n⚠️ Нет полей для смены пароля/деавторизации: <code>{', '.join(warn)}</code>"
             send(m.chat.id, f"✅ {txt}{extra}", _main_kb())
-            if SETTINGS.auto_enable_lots and cardinal_ref:
-                acc_tag = _ntag(d["tag"])
-                def _auto_enable_add(tag=acc_tag):
-                    toggled = _toggle_fp_lots_for_tag(cardinal_ref, tag, True)
-                    if toggled and tg_logs:
-                        tg_logs.lots_auto_enabled(tag, toggled)
+            new_acc = next((a for a in ACCOUNTS if a.login.lower() == actual_login.lower()), None)
+            if SETTINGS.auto_enable_lots and cardinal_ref and new_acc:
+                notify_chat = m.chat.id
+                def _auto_enable_add(account_id=new_acc.id, notify_chat=notify_chat):
+                    enabled, disabled = _resync_lots_for_account(cardinal_ref, account_id)
+                    if enabled and tg_logs:
+                        tg_logs.lots_auto_enabled(f"Аккаунт: <code>#{account_id}</code>", enabled, chat_id=notify_chat)
                 threading.Thread(target=_auto_enable_add, daemon=True).start()
         else:
             send(m.chat.id, f"❌ {txt}", _main_kb())
 
     def open_lots(c):
-        fp_active: Dict[str, Optional[bool]] = {}
-        try:
-            fp_lots = _get_cached_lots(cardinal_ref)
-            fp_active = {str(l.id): l.active for l in fp_lots}
-            logger.debug(f"[AutoSteamRent] lots cache: {list(fp_active.keys())[:10]}, settings lots: {list(SETTINGS.lots.keys())[:10]}")
-        except Exception as e:
-            logger.warning(f"[AutoSteamRent] Не удалось получить статусы лотов с FunPay: {e}")
-        count = len(SETTINGS.lots)
+        pg = _pid(c)
+        lot_ids = list(SETTINGS.lots.keys())
+        total = len(lot_ids)
+        tp = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        pg = max(0, min(pg, tp - 1))
+        start, end = pg * PAGE_SIZE, (pg + 1) * PAGE_SIZE
         kb = K(row_width=1)
-        kb.row(B(f"{_is_on(SETTINGS.auto_disable_lots)} Авто-выкл при пустом складе",
-                 None, f"{CBT.TOGGLE}:auto_disable_lots"))
-        kb.row(B(f"{_is_on(SETTINGS.auto_enable_lots)} Авто-вкл при добавлении аккаунта",
-                 None, f"{CBT.TOGGLE}:auto_enable_lots"))
-        if count:
-            kb.row(
-                B("🔴 Выкл все", None, CBT.LOTS_DISABLE_ALL),
-                B("🟢 Вкл все", None, CBT.LOTS_ENABLE_ALL),
-            )
-            for lid in SETTINGS.lots:
+        if pg == 0:
+            kb.row(B(f"{_is_on(SETTINGS.auto_disable_lots)} Авто-выкл при пустом складе",
+                     None, f"{CBT.TOGGLE}:auto_disable_lots"))
+            kb.row(B(f"{_is_on(SETTINGS.auto_enable_lots)} Авто-вкл при добавлении аккаунта",
+                     None, f"{CBT.TOGGLE}:auto_enable_lots"))
+        if total:
+            if pg == 0:
+                kb.row(
+                    B("🔴 Выкл все", None, CBT.LOTS_DISABLE_ALL),
+                    B("🟢 Вкл все", None, CBT.LOTS_ENABLE_ALL),
+                )
+            for lid in lot_ids[start:end]:
                 lc = SETTINGS.get_lot(lid)
                 if lc:
-                    fp_status = fp_active.get(lid)
-                    fp_icon = "🟢" if fp_status is True else ("🔴" if fp_status is False else "⚪")
-                    free = AccountRepo.count_free(lc.tag).get(_ntag(lc.tag), 0)
+                    if not lc.account_ids:
+                        suffix = " (без аккаунта)"
+                    else:
+                        accs = [AccountRepo.get(aid) for aid in lc.account_ids]
+                        free_n = sum(1 for a in accs if a and a.status == RentStatus.FREE)
+                        suffix = " (все заняты)" if free_n == 0 else ""
                     kb.add(B(
-                        f"{fp_icon} #{lid}  ·  {lc.tag}  ·  {_period_label(lc.hours)}  ·  {free} шт.",
+                        f"#{lid} — {_period_label(lc.hours)}{suffix}",
                         None, f"{CBT.LOT_DETAIL}:{lid}"
                     ))
-        kb.row(B("➕ Добавить лот", None, CBT.LOT_ADD))
+        nav = []
+        if pg > 0:
+            nav.append(B("⬅️", None, f"{CBT.LOTS}:{pg - 1}"))
+        nav.append(B(f"{pg + 1}/{tp}", None, _CBT.EMPTY))
+        if end < total:
+            nav.append(B("➡️", None, f"{CBT.LOTS}:{pg + 1}"))
+        if nav:
+            kb.row(*nav)
+        if pg == 0:
+            kb.row(B("➕ Добавить лот", None, CBT.LOT_ADD))
         kb.add(B("⬅️ Назад", None, CBT.MAIN))
         auto_dis = "🟢 вкл" if SETTINGS.auto_disable_lots else "🔴 выкл"
         auto_en  = "🟢 вкл" if SETTINGS.auto_enable_lots  else "🔴 выкл"
-        if count:
+        if total:
             text = (
                 f"<b>🔗 Лоты</b>\n\n"
                 f"<b>Авто-управление</b>\n"
                 f"∟ Выкл при пустом складе: {auto_dis}\n"
                 f"∟ Вкл при добавлении аккаунта: {auto_en}\n\n"
-                f"<b>Лоты</b> — всего: <code>{count}</code>\n"
-                f"∟ 🟢 включён  🔴 выключен  ⚪ нет данных"
+                f"<b>Лоты</b> — всего: <code>{total}</code>"
             )
         else:
             text = (
@@ -3089,32 +3995,44 @@ def init(card: Cardinal):
         if not lc:
             return answer(c, "❌ Лот не найден", True)
         lot_url = FUNPAY_LOT_URL.format(lot_id=lid)
-        free_count = AccountRepo.count_free(lc.tag).get(_ntag(lc.tag), 0)
+        if not lc.account_ids:
+            acc_block = "   не привязан к аккаунтам"
+        else:
+            parts = []
+            for aid in lc.account_ids:
+                acc = AccountRepo.get(aid)
+                if acc is None:
+                    parts.append(f"   #{aid} — аккаунт удалён")
+                else:
+                    status_str = "свободен" if acc.status == RentStatus.FREE else "занят"
+                    parts.append(f"   #{acc.id} {acc.login} — {status_str}")
+            acc_block = "\n".join(parts)
         fp_active: Optional[bool] = None
         try:
             fp_lots = _get_cached_lots(cardinal_ref)
             fp_lot = next((l for l in fp_lots if str(l.id) == lid), None)
-            if fp_lot is not None:
+            if fp_lot is not None and hasattr(fp_lot, "active"):
                 fp_active = fp_lot.active
+            else:
+                lf = cardinal_ref.account.get_lot_fields(int(lid))
+                fp_active = lf.active
         except Exception:
             pass
         if fp_active is True:
-            active_str = "🟢 Включён"
+            active_str = "Включён"
         elif fp_active is False:
-            active_str = "🔴 Выключен"
+            active_str = "Выключен"
         else:
-            active_str = "⚪ Нет данных"
+            active_str = "Не удалось получить статус с FunPay"
         text = (
-            f"<b>🔗 Лот #{lid}</b>\n\n"
-            f"∟ Тег: <code>{lc.tag}</code>\n"
-            f"∟ Период: <code>{_period_label(lc.hours)}</code>\n"
-            f"∟ Свободных аккаунтов: <code>{free_count}</code>\n"
-            f"∟ Статус на FunPay: {active_str}\n"
+            f"<b>Лот на {_period_label(lc.hours)} — #{lid}</b>\n\n"
+            f"∟ Статус: <b>{active_str}</b>\n"
+            f"∟ Аккаунты:\n{acc_block}\n\n"
             f"∟ Ссылка: {lot_url}"
         )
         kb = K(row_width=2)
         kb.add(
-            B("✏️ Изменить тег", None, f"{CBT.LOT_EDIT}:{lid}"),
+            B("✏️ Изменить аккаунты", None, f"{CBT.LOT_EDIT}:{lid}"),
             B("🔢 Изменить ID", None, f"{CBT.LOT_RENAME}:{lid}")
         )
         if fp_active is True:
@@ -3124,7 +4042,7 @@ def init(card: Cardinal):
         else:
             kb.add(B("⚡ Вкл/Выкл на FunPay", None, f"{CBT.LOT_TOGGLE_FP}:{lid}:toggle"))
         kb.add(B("🗑 Удалить", None, f"{CBT.LOT_DEL_CONFIRM}:{lid}"))
-        kb.add(B("⬅️ К списку", None, CBT.LOTS))
+        kb.add(B("⬅️ К списку", None, f"{CBT.LOTS}:0"))
         edit(c.message, text, kb)
 
     def lot_rename(c):
@@ -3170,10 +4088,12 @@ def init(card: Cardinal):
         lc = SETTINGS.get_lot(lid)
         if not lc:
             return answer(c, "❌ Лот не найден", True)
+        logins = [a.login for aid in lc.account_ids if (a := AccountRepo.get(aid))]
+        acc_label = ", ".join(logins) if logins else "не привязан"
         text = (
             f"⚠️ <b>Удалить лот?</b>\n\n"
             f"∟ ID: <code>{lid}</code>\n"
-            f"∟ Тег: <code>{lc.tag}</code>\n"
+            f"∟ Аккаунты: <code>{acc_label}</code>\n"
             f"∟ Период: <code>{_period_label(lc.hours)}</code>\n\n"
             f"❗ Это действие необратимо!"
         )
@@ -3187,7 +4107,11 @@ def init(card: Cardinal):
     def lot_del_yes(c):
         lid = _p(c)
         lc = SETTINGS.get_lot(lid)
-        name = f"#{lid} ({lc.tag})" if lc else f"#{lid}"
+        if lc and lc.account_ids:
+            logins = [a.login for aid in lc.account_ids if (a := AccountRepo.get(aid))]
+            name = f"#{lid} ({', '.join(logins)})" if logins else f"#{lid}"
+        else:
+            name = f"#{lid}"
         SETTINGS.del_lot(lid)
         _invalidate_lots_cache()
         answer(c, f"✅ Лот {name} удалён")
@@ -3199,47 +4123,74 @@ def init(card: Cardinal):
         c.data = f"{CBT.LOT_DETAIL}:{lid}"
         open_lot_detail(c)
 
+    def _render_lot_edit_accounts(c, lid):
+        lc = SETTINGS.get_lot(lid)
+        d = _temp_storage.setdefault(c.from_user.id, {})
+        sel = d.get("edit_sel_accs", list(lc.account_ids) if lc else [])
+        d["edit_sel_accs"] = sel
+        accounts = AccountRepo.list_all()
+        kb = K(row_width=1)
+        for acc in accounts:
+            prefix = "✅ " if acc.id in sel else ""
+            free = "🟢" if acc.status == RentStatus.FREE else "🔴"
+            kb.add(B(f"{prefix}{free} #{acc.id} {acc.login}", None, f"{CBT.LOT_EDIT_TAG}:{lid}:{acc.id}"))
+        kb.row(B("✅ Готово", None, f"{CBT.LOT_EDIT_ACC_DONE}:{lid}"))
+        kb.add(B("⬅️ Назад", None, f"{CBT.LOT_DETAIL}:{lid}"))
+        sel_logins = ", ".join(a.login for a in accounts if a.id in sel) or "не выбрано"
+        edit(c.message,
+             f"✏️ <b>Изменить лот #{lid}</b>\n\n"
+             f"Выбрано: <code>{sel_logins}</code>\n\n"
+             f"Отметьте один или несколько аккаунтов (пул для этого лота):", kb)
+
     def lot_edit(c):
         lid = _p(c)
         lc = SETTINGS.get_lot(lid)
         if not lc:
             return answer(c, "❌ Лот не найден", True)
         _temp_storage.setdefault(c.from_user.id, {})["edit_lot_id"] = lid
-        _temp_storage[c.from_user.id]["edit_lot_tag"] = lc.tag
-        _temp_storage[c.from_user.id]["edit_lot_hrs"] = lc.hours
-        tags = AccountRepo.all_tags()
-        if not tags:
+        _temp_storage[c.from_user.id]["edit_sel_accs"] = list(lc.account_ids)
+        if not AccountRepo.list_all():
             return answer(c, "❌ Нет аккаунтов!", True)
-        kb = K(row_width=2)
-        for tag in tags:
-            prefix = "✅ " if tag == lc.tag else ""
-            kb.add(B(f"{prefix}{tag}", None, f"{CBT.LOT_EDIT_TAG}:{lid}:{tag}"))
-        kb.add(B("⬅️ Назад", None, f"{CBT.LOT_DETAIL}:{lid}"))
-        edit(c.message,
-             f"✏️ <b>Изменить лот #{lid}</b>\n\n"
-             f"Текущий тег: <code>{lc.tag}</code>\n\n"
-             f"Выберите новый тег:", kb)
+        _render_lot_edit_accounts(c, lid)
 
     def lot_edit_tag(c):
         try:
             parts = c.data.split(":")
             lid = parts[1]
-            new_tag = _ntag(parts[2])
+            account_id = int(parts[2])
         except (IndexError, ValueError):
             return answer(c, "❌ Неверные данные", True)
         d = _temp_storage.setdefault(c.from_user.id, {})
         d["edit_lot_id"] = lid
-        d["edit_lot_tag"] = new_tag
+        sel = d.setdefault("edit_sel_accs", [])
+        if account_id in sel:
+            sel.remove(account_id)
+        else:
+            sel.append(account_id)
+        answer(c)
+        _render_lot_edit_accounts(c, lid)
+
+    def lot_edit_acc_done(c):
+        lid = _p(c)
+        d = _temp_storage.get(c.from_user.id, {})
+        sel = d.get("edit_sel_accs", [])
+        if not sel:
+            return answer(c, "❌ Выберите хотя бы один аккаунт!", True)
+        d["edit_lot_account_ids"] = sel
         lc = SETTINGS.get_lot(lid)
         cur_hrs = lc.hours if lc else 24
+        periods = sorted({h for aid in sel for h in (AccountRepo.get(aid).allowed_hours if AccountRepo.get(aid) else [])})
+        answer(c)
         kb = K(row_width=3)
-        for h in ALL_PERIODS:
+        for h in periods:
             prefix = "✅ " if h == cur_hrs else ""
             kb.add(B(f"{prefix}{_period_label(h)}", None, f"{CBT.LOT_EDIT_HRS}:{lid}:{h}"))
+        kb.row(B("✏️ Своё время", None, f"{CBT.LOT_EDIT_HRS_CUSTOM}:{lid}"))
         kb.add(B("⬅️ Назад", None, f"{CBT.LOT_EDIT}:{lid}"))
+        logins = ", ".join(a.login for aid in sel if (a := AccountRepo.get(aid)))
         edit(c.message,
              f"✏️ <b>Изменить лот #{lid}</b>\n\n"
-             f"Тег: <code>{new_tag}</code>\n\n"
+             f"Аккаунты: <code>{logins}</code>\n\n"
              f"Выберите период:", kb)
 
     def lot_edit_hrs(c):
@@ -3247,8 +4198,13 @@ def init(card: Cardinal):
         lid = parts[1]
         new_hrs = int(parts[2])
         d = _temp_storage.get(c.from_user.id, {})
-        new_tag = d.get("edit_lot_tag", "default")
-        SETTINGS.set_lot(lid, new_tag, new_hrs)
+        new_account_ids = d.get("edit_lot_account_ids")
+        if not new_account_ids:
+            lc = SETTINGS.get_lot(lid)
+            new_account_ids = lc.account_ids if lc else []
+        if not new_account_ids:
+            return answer(c, "❌ Аккаунты не выбраны", True)
+        SETTINGS.set_lot(lid, new_account_ids, new_hrs)
         _invalidate_lots_cache()
         answer(c, "✅ Лот обновлён!")
         c.data = f"{CBT.LOT_DETAIL}:{lid}"
@@ -3279,116 +4235,320 @@ def init(card: Cardinal):
 
     def lots_disable_all(c):
         answer(c)
-        edit(c.message, "⏳ Выключаю лоты на FunPay...", _back_kb(CBT.LOTS))
+        edit(c.message, "⏳ Выключаю лоты на FunPay...", _back_kb(f"{CBT.LOTS}:0"))
         chat_id = c.message.chat.id
         def _do():
-            tags = list({_ntag((SETTINGS.get_lot(lid) or LotConfig(tag="default", hours=24)).tag)
-                         for lid in SETTINGS.lots})
-            total = []
-            for tag in tags:
-                total.extend(_toggle_fp_lots_for_tag(cardinal_ref, tag, False))
-            if total and tg_logs:
-                tg_logs.lots_auto_disabled("all", total)
-            send(chat_id, f"🔴 Выключено лотов: {len(total)}" if total else "ℹ️ Нечего выключать")
+            total = _set_fp_lots_active(cardinal_ref, list(SETTINGS.lots.keys()), False)
+            _invalidate_lots_cache()
+            if total:
+                lots_str = ", ".join(f"#{lid}" for lid in total)
+                send(chat_id, f"🔴 Выключено лотов: {len(total)}\n∟ Лоты: {lots_str}")
+            else:
+                send(chat_id, "ℹ️ Нечего выключать")
         threading.Thread(target=_do, daemon=True).start()
 
     def lots_enable_all(c):
         answer(c)
-        edit(c.message, "⏳ Включаю лоты на FunPay...", _back_kb(CBT.LOTS))
+        edit(c.message, "⏳ Включаю лоты на FunPay...", _back_kb(f"{CBT.LOTS}:0"))
         chat_id = c.message.chat.id
         def _do():
-            tags = list({_ntag((SETTINGS.get_lot(lid) or LotConfig(tag="default", hours=24)).tag)
-                         for lid in SETTINGS.lots})
-            total = []
-            for tag in tags:
-                total.extend(_toggle_fp_lots_for_tag(cardinal_ref, tag, True))
-            if total and tg_logs:
-                tg_logs.lots_auto_enabled("all", total)
-            send(chat_id, f"🟢 Включено лотов: {len(total)}" if total else "ℹ️ Нечего включать")
+            total = _set_fp_lots_active(cardinal_ref, list(SETTINGS.lots.keys()), True)
+            _invalidate_lots_cache()
+            if total:
+                lots_str = ", ".join(f"#{lid}" for lid in total)
+                send(chat_id, f"🟢 Включено лотов: {len(total)}\n∟ Лоты: {lots_str}")
+            else:
+                send(chat_id, "ℹ️ Нечего включать")
         threading.Thread(target=_do, daemon=True).start()
+
+    def _render_lot_add_accounts(chat_id, user_id, msg_id=None):
+        d = _temp_storage.setdefault(user_id, {})
+        sel = d.get("lot_sel_accs", [])
+        accounts = AccountRepo.list_all()
+        kb = K(row_width=1)
+        for acc in accounts:
+            prefix = "✅ " if acc.id in sel else ""
+            free = "🟢" if acc.status == RentStatus.FREE else "🔴"
+            kb.add(B(f"{prefix}{free} #{acc.id} {acc.login}", None, f"{CBT.LOT_TAG}:{acc.id}"))
+        kb.row(B("✅ Готово", None, CBT.LOT_ACC_DONE))
+        kb.add(B("⬅️ Назад", None, f"{CBT.LOTS}:0"))
+        sel_logins = ", ".join(a.login for a in accounts if a.id in sel) or "не выбрано"
+        text = f"Выбрано: <code>{sel_logins}</code>\n\nОтметьте один или несколько аккаунтов (пул для этого лота):"
+        if msg_id:
+            try:
+                bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode='HTML')
+            except Exception:
+                pass
+        else:
+            msg = send(chat_id, text, kb)
+            d["bot_msg_id"] = msg.message_id
 
     def lot_add(c):
         answer(c)
         _ask(c.message.chat.id, c.from_user.id,
              States.LOT_ID,
              "Введите <b>ID лота</b> или ссылку на лот:",
-             _back_kb(CBT.LOTS))
+             _back_kb(f"{CBT.LOTS}:0"))
 
     def _h_lot_id(m):
-        raw = (m.text or "").strip()
-        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
-        lot_id = _extract_lot_id(raw)
-        if not lot_id:
-            send(m.chat.id,
-                 "❌ Не удалось распознать ID лота. Введите число или ссылку funpay.com/lots/offer?id=...",
-                 _back_kb(CBT.LOTS))
-            return
-        if SETTINGS.has_lot(lot_id):
-            send(m.chat.id, f"❌ Лот <code>{lot_id}</code> уже добавлен", _back_kb(CBT.LOTS))
-            return
-        _temp_storage.setdefault(m.from_user.id, {})["lot_id"] = lot_id
-        tags = AccountRepo.all_tags()
-        if not tags:
-            send(m.chat.id, "❌ Сначала добавьте аккаунты!", _main_kb())
-            return
-        kb = K()
-        for tag in tags:
-            kb.add(B(tag, None, f"{CBT.LOT_TAG}:{tag}"))
-        kb.add(B("⬅️ Назад", None, CBT.LOTS))
-        send(m.chat.id, "Выберите <b>тег</b>:", kb)
+        try:
+            raw = (m.text or "").strip()
+            _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+            lot_id = _extract_lot_id(raw)
+            if not lot_id:
+                send(m.chat.id,
+                     "❌ Не удалось распознать ID лота. Введите число или ссылку funpay.com/lots/offer?id=...",
+                     _back_kb(f"{CBT.LOTS}:0"))
+                return
+            if SETTINGS.has_lot(lot_id):
+                send(m.chat.id, f"❌ Лот <code>{lot_id}</code> уже добавлен", _back_kb((f"{CBT.LOTS}:0")))
+                return
+            if not AccountRepo.list_all():
+                send(m.chat.id, "❌ Сначала добавьте аккаунты!", _main_kb())
+                return
+            _temp_storage.setdefault(m.from_user.id, {})["lot_id"] = lot_id
+            _temp_storage[m.from_user.id]["lot_sel_accs"] = []
+            _render_lot_add_accounts(m.chat.id, m.from_user.id)
+        except Exception as e:
+            logger.error(f"[AutoSteamRent] _h_lot_id error: {e}", exc_info=True)
+            try:
+                send(m.chat.id, f"❌ Внутренняя ошибка: {_safe_err(e)}", _main_kb())
+            except Exception:
+                pass
 
     def lot_tag(c):
-        tag = _ntag(_p(c))
-        _temp_storage.setdefault(c.from_user.id, {})["lot_tag"] = tag
+        account_id = _pid(c)
+        acc = AccountRepo.get(account_id)
+        if not acc:
+            return answer(c, "❌ Аккаунт не найден", True)
+        d = _temp_storage.setdefault(c.from_user.id, {})
+        sel = d.setdefault("lot_sel_accs", [])
+        if account_id in sel:
+            sel.remove(account_id)
+        else:
+            sel.append(account_id)
+        answer(c)
+        _render_lot_add_accounts(c.message.chat.id, c.from_user.id, c.message.message_id)
+
+    def lot_acc_done(c):
+        d = _temp_storage.get(c.from_user.id, {})
+        sel = d.get("lot_sel_accs", [])
+        if not sel:
+            return answer(c, "❌ Выберите хотя бы один аккаунт!", True)
+        answer(c)
+        periods = sorted({h for aid in sel for h in (AccountRepo.get(aid).allowed_hours if AccountRepo.get(aid) else [])})
         kb = K(row_width=3)
-        for h in ALL_PERIODS:
+        for h in periods:
             kb.add(B(_period_label(h), None, f"{CBT.LOT_HRS}:{h}"))
-        kb.add(B("⬅️", None, CBT.LOTS))
-        edit(c.message, f"Тег: <code>{tag}</code>\n\nВыберите <b>период</b>:", kb)
+        kb.row(B("✏️ Своё время", None, CBT.LOT_HRS_CUSTOM))
+        kb.add(B("⬅️", None, f"{CBT.LOTS}:0"))
+        logins = ", ".join(a.login for aid in sel if (a := AccountRepo.get(aid)))
+        edit(c.message, f"Аккаунты: <code>{logins}</code>\n\nВыберите <b>период</b>:", kb)
 
     def lot_hours(c):
         h = _pid(c)
         d = _temp_storage.get(c.from_user.id, {})
         lid = d.get("lot_id")
-        tag = d.get("lot_tag", "default")
-        if lid:
-            SETTINGS.set_lot(str(lid), tag, h)
+        account_ids = d.get("lot_sel_accs", [])
+        if lid and account_ids:
+            sub_id = None
+            try:
+                fp_lots = _get_cached_lots(cardinal_ref)
+                fp_lot = next((l for l in fp_lots if str(l.id) == str(lid)), None)
+                if fp_lot:
+                    sub = getattr(fp_lot, "subcategory", None)
+                    sub_id = getattr(sub, "id", None) if sub else None
+            except Exception:
+                pass
+            SETTINGS.set_lot(str(lid), account_ids, h, subcategory_id=sub_id)
             _invalidate_lots_cache()
-        edit(c.message, f"✅ Лот {lid} → <code>{tag}</code>, <code>{_period_label(h)}</code>", _main_kb())
+        answer(c, f"✅ Лот {lid} добавлен")
+        c.data = f"{CBT.LOT_DETAIL}:{lid}"
+        open_lot_detail(c)
+
+    def _parse_custom_hours(text: str):
+        m = re.match(r"^\s*(\d+)\s*$", (text or "").strip())
+        if m:
+            h = int(m.group(1))
+            return h if h > 0 else None
+        return None
+
+    def lot_hrs_custom(c):
+        answer(c)
+        d = _temp_storage.get(c.from_user.id, {})
+        account_ids = d.get("lot_sel_accs", [])
+        logins = ", ".join(a.login for aid in account_ids if (a := AccountRepo.get(aid))) or "—"
+        _ask(c.message.chat.id, c.from_user.id,
+             States.LOT_HRS_CUSTOM,
+             f"Аккаунты: <code>{logins}</code>\n\nВведите <b>своё время аренды</b> в часах:\n"
+             f"<i>Примеры: 48, 60, 120, 1440</i>",
+             _back_kb(f"{CBT.LOTS}:0"))
+
+    def _h_lot_hrs_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 48", _back_kb(f"{CBT.LOTS}:0"))
+            return
+        d = _temp_storage.get(m.from_user.id, {})
+        lid = d.get("lot_id")
+        account_ids = d.get("lot_sel_accs", [])
+        if lid and account_ids:
+            sub_id = None
+            try:
+                fp_lots = _get_cached_lots(cardinal_ref)
+                fp_lot = next((l for l in fp_lots if str(l.id) == str(lid)), None)
+                if fp_lot:
+                    sub = getattr(fp_lot, "subcategory", None)
+                    sub_id = getattr(sub, "id", None) if sub else None
+            except Exception:
+                pass
+            SETTINGS.set_lot(str(lid), account_ids, h, subcategory_id=sub_id)
+            _invalidate_lots_cache()
+        logins = ", ".join(a.login for aid in account_ids if (a := AccountRepo.get(aid)))
+        send(m.chat.id, f"✅ Лот {lid} → <code>{logins}</code>, <code>{_period_label(h)}</code>",
+             _back_kb(f"{CBT.LOT_DETAIL}:{lid}"))
+
+    def lot_edit_hrs_custom(c):
+        answer(c)
+        lid = _p(c)
+        _temp_storage.setdefault(c.from_user.id, {})["edit_lot_id"] = lid
+        _ask(c.message.chat.id, c.from_user.id,
+             States.LOT_EDIT_HRS_CUSTOM,
+             f"Лот <code>#{lid}</code>\n\nВведите <b>своё время аренды</b> в часах:\n"
+             f"<i>Примеры: 48, 60, 120, 1440</i>",
+             _back_kb(f"{CBT.LOT_EDIT}:{lid}"))
+
+    def _h_lot_edit_hrs_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 48", _main_kb())
+            return
+        d = _temp_storage.get(m.from_user.id, {})
+        lid = d.get("edit_lot_id")
+        new_account_ids = d.get("edit_lot_account_ids")
+        if not new_account_ids:
+            lc = SETTINGS.get_lot(lid)
+            new_account_ids = lc.account_ids if lc else []
+        if not lid or not new_account_ids:
+            send(m.chat.id, "❌ Данные потеряны, начните заново.", _main_kb())
+            return
+        SETTINGS.set_lot(lid, new_account_ids, h)
+        _invalidate_lots_cache()
+        send(m.chat.id, f"✅ Лот #{lid} обновлён: <code>{_period_label(h)}</code>", _main_kb())
+
+    def acc_hrs_custom(c):
+        answer(c)
+        d = _temp_storage.get(c.from_user.id, {})
+        sel = d.get("sel_hrs", [])
+        bot_msg_id = d.get("bot_msg_id")
+        _ask(c.message.chat.id, c.from_user.id,
+             States.ACC_HRS_CUSTOM,
+             "Введите <b>своё время аренды</b> в часах:\n"
+             "<i>Примеры: 48, 60, 120, 1440</i>",
+             _back_kb(CBT.ACC_MENU))
+        if bot_msg_id:
+            _try_delete(c.message.chat.id, bot_msg_id)
+
+    def _h_acc_hrs_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 48", _back_kb(CBT.ACC_MENU))
+            return
+        d = _temp_storage.setdefault(m.from_user.id, {})
+        sel = d.get("sel_hrs", [])
+        if h not in sel:
+            sel.append(h)
+        d["sel_hrs"] = sel
+        aid = d.get("ehrs_id")
+        if aid:
+            acc = AccountRepo.get(aid)
+            kb = _hours_kb(sel, CBT.ACC_TOGGLE_HOUR, f"{CBT.ACC_SAVE_HOURS}:{aid}",
+                           f"{CBT.ACC_DETAIL}:{aid}")
+            label = f"⏱ <b>Периоды для {acc.login if acc else '?'}</b>\n\nВыберите (✅ = вкл):"
+        else:
+            kb = _hours_kb(sel, CBT.HRS_TGL, CBT.HRS_DONE, CBT.ACC_MENU)
+            label = "4️⃣ Выберите <b>периоды аренды</b>:"
+        msg = send(m.chat.id, label, kb)
+        d["bot_msg_id"] = msg.message_id
 
     def open_reviews(c):
         rules = SETTINGS.get_review_rules()
         kb = K(row_width=1)
         for r in rules:
             bl = _period_label(int(r.bonus_hours)) if r.bonus_hours == int(r.bonus_hours) else f"{r.bonus_hours}ч"
-            kb.add(B(f"🎁 {_period_label(r.rent_hours)} → +{bl} ❌", None, f"{CBT.REV_DEL}:{r.rent_hours}"))
-        kb.add(B("➕ Добавить", None, CBT.REV_ADD))
+            kb.add(B(f"🎁 от {_period_label(r.rent_hours)} → +{bl}", None, f"{CBT.REV_DETAIL}:{r.rent_hours}"))
+        kb.add(B("➕ Добавить правило", None, CBT.REV_ADD))
+        stars = SETTINGS.bonus_min_stars
+        kb.add(B(f"⭐ Мин. оценка отзыва: {stars}⭐", None, CBT.REV_MINSTARS))
         kb.add(B("⬅️ Назад", None, CBT.MAIN))
-        txt = "<b>⭐️ Бонусы за отзывы</b>\n\n"
+        txt = (
+            "🎁 <b>Бонус за отзыв</b>\n\n"
+            "Если покупатель оставит отзыв с оценкой не ниже минимальной, пока аккаунт ещё у него "
+            "в аренде, время аренды автоматически продлевается на бонусные часы.\n\n"
+            f"∟ Мин. оценка для бонуса: <code>{stars}⭐</code>\n"
+        )
         if rules:
+            txt += "\n<b>Правила</b> (аренда от → бонус):\n"
             txt += "".join(f"∟ от <code>{_period_label(r.rent_hours)}</code> → <code>+{r.bonus_hours}ч</code>\n"
                            for r in rules)
-            txt += "\nНажмите для удаления."
+            txt += "\nНажмите на правило, чтобы изменить или удалить."
         else:
-            txt += "Правил нет."
+            txt += "\nПравил нет — бонусы не начисляются."
         edit(c.message, txt, kb)
+
+    def _bonus_kb(back_cb):
+        kb = K(row_width=3)
+        for bh in ALL_PERIODS:
+            kb.add(B(_period_label(bh), None, f"{CBT.REV_BON}:{bh}"))
+        kb.row(B("✏️ Своё время", None, CBT.REV_BON_CUSTOM))
+        kb.add(B("⬅️ Назад", None, back_cb))
+        return kb
 
     def rev_add(c):
         answer(c)
         kb = K(row_width=3)
         for h in ALL_PERIODS:
             kb.add(B(_period_label(h), None, f"{CBT.REV_HRS}:{h}"))
-        kb.add(B("⬅️", None, CBT.REVS))
-        edit(c.message, "Мин. <b>период аренды</b>:", kb)
+        kb.add(B("⬅️ Назад", None, CBT.REVS))
+        edit(c.message, "Мин. <b>период аренды</b>, с которого действует бонус:", kb)
 
     def rev_hours(c):
         h = _pid(c)
         _temp_storage.setdefault(c.from_user.id, {})["rev_rh"] = h
-        kb = K(row_width=3)
-        for bh in [1, 2, 3, 6, 12, 24]:
-            kb.add(B(_period_label(bh), None, f"{CBT.REV_BON}:{bh}"))
-        kb.add(B("⬅️", None, CBT.REVS))
-        edit(c.message, f"Аренда от: <code>{_period_label(h)}</code>\n\n<b>Бонус</b>:", kb)
+        answer(c)
+        edit(c.message, f"Аренда от: <code>{_period_label(h)}</code>\n\n<b>Бонус</b>:", _bonus_kb(CBT.REV_ADD))
+
+    def rev_detail(c):
+        rh = _pid(c)
+        rule = next((r for r in SETTINGS.get_review_rules() if r.rent_hours == rh), None)
+        if not rule:
+            return answer(c, "❌ Правило не найдено", True)
+        bl = _period_label(int(rule.bonus_hours)) if rule.bonus_hours == int(rule.bonus_hours) else f"{rule.bonus_hours}ч"
+        text = (
+            f"🎁 <b>Правило бонуса</b>\n\n"
+            f"∟ Аренда от: <code>{_period_label(rh)}</code>\n"
+            f"∟ Бонус: <code>+{bl}</code>\n\n"
+            f"Начислится, если аренда была от {_period_label(rh)}, а отзыв — не ниже "
+            f"{SETTINGS.bonus_min_stars}⭐."
+        )
+        kb = K(row_width=2)
+        kb.add(B("✏️ Изменить бонус", None, f"{CBT.REV_EDIT}:{rh}"))
+        kb.add(B("🗑 Удалить", None, f"{CBT.REV_DEL}:{rh}"))
+        kb.add(B("⬅️ Назад", None, CBT.REVS))
+        edit(c.message, text, kb)
+
+    def rev_edit(c):
+        rh = _pid(c)
+        rule = next((r for r in SETTINGS.get_review_rules() if r.rent_hours == rh), None)
+        if not rule:
+            return answer(c, "❌ Правило не найдено", True)
+        _temp_storage.setdefault(c.from_user.id, {})["rev_rh"] = rh
+        answer(c)
+        edit(c.message, f"Аренда от: <code>{_period_label(rh)}</code>\n\n<b>Новый бонус</b>:",
+             _bonus_kb(f"{CBT.REV_DETAIL}:{rh}"))
 
     def rev_bonus(c):
         bh = _pid(c)
@@ -3397,9 +4557,110 @@ def init(card: Cardinal):
         answer(c, f"✅ {_period_label(rh)} → +{_period_label(bh)}")
         open_reviews(c)
 
-    def rev_del(c):
-        SETTINGS.del_review_rule(_pid(c))
+    def rev_bon_custom(c):
+        answer(c)
+        rh = _temp_storage.get(c.from_user.id, {}).get("rev_rh", 3)
+        _ask(c.message.chat.id, c.from_user.id,
+             States.REV_BON_CUSTOM,
+             f"Аренда от: <code>{_period_label(rh)}</code>\n\nВведите <b>свой бонус</b> в часах:\n"
+             f"<i>Примеры: 8, 18, 36</i>",
+             _back_kb(CBT.REVS))
+
+    def _h_rev_bon_custom(m):
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        h = _parse_custom_hours(m.text or "")
+        if not h:
+            send(m.chat.id, "❌ Неверный формат. Введите целое число часов, например: 8", _back_kb(CBT.REVS))
+            return
+        rh = _temp_storage.get(m.from_user.id, {}).get("rev_rh", 3)
+        SETTINGS.add_review_rule(rh, float(h))
+        send(m.chat.id, f"✅ {_period_label(rh)} → +{_period_label(h)}", _back_kb(CBT.REVS))
+
+    def rev_minstars(c):
+        answer(c)
+        kb = K(row_width=5)
+        for n in range(1, 6):
+            prefix = "✅ " if n == SETTINGS.bonus_min_stars else ""
+            kb.add(B(f"{prefix}{n}⭐", None, f"{CBT.REV_MINSTARS_SET}:{n}"))
+        kb.add(B("⬅️ Назад", None, CBT.REVS))
+        edit(c.message,
+             "⭐ <b>Минимальная оценка отзыва для бонуса</b>\n\n"
+             "Бонус часов начислится только если покупатель поставит оценку не ниже выбранной.",
+             kb)
+
+    def rev_minstars_set(c):
+        n = _pid(c)
+        SETTINGS.set_bonus_min_stars(n)
+        answer(c, f"✅ Мин. оценка для бонуса: {n}⭐")
         open_reviews(c)
+
+    def rev_del(c):
+        rh = _pid(c)
+        rule = next((r for r in SETTINGS.get_review_rules() if r.rent_hours == rh), None)
+        if not rule:
+            return answer(c, "❌ Правило не найдено", True)
+        bl = _period_label(int(rule.bonus_hours)) if rule.bonus_hours == int(rule.bonus_hours) else f"{rule.bonus_hours}ч"
+        text = (
+            f"⚠️ <b>Удалить правило бонуса?</b>\n\n"
+            f"∟ Аренда от: <code>{_period_label(rh)}</code>\n"
+            f"∟ Бонус: <code>+{bl}</code>\n\n"
+            f"❗ Это действие необратимо!"
+        )
+        kb = K(row_width=2)
+        kb.add(
+            B("✅ Да", None, f"{CBT.REV_DEL_YES}:{rh}"),
+            B("❌ Нет", None, f"{CBT.REV_DEL_NO}:{rh}")
+        )
+        edit(c.message, text, kb)
+
+    def rev_del_yes(c):
+        rh = _pid(c)
+        SETTINGS.del_review_rule(rh)
+        answer(c, f"✅ Правило для {_period_label(rh)} удалено")
+        open_reviews(c)
+
+    def rev_del_no(c):
+        answer(c, "❌ Удаление отменено")
+        open_reviews(c)
+
+    def open_proxy(c):
+        cur = SETTINGS.pwd_change_proxy or "не задан"
+        text = (
+            "<b>🌐 Прокси для смены пароля</b>\n\n"
+            f"∟ Текущий: <code>{cur}</code>\n\n"
+            "Прокси используется для запросов к Steam при смене пароля.\n"
+            "Нужен если бот на хостинге и Steam не доверяет его IP.\n\n"
+            "Форматы:\n"
+            "<code>http://user:pass@host:port</code>\n"
+            "<code>socks5://user:pass@host:port</code>\n\n"
+            "Введите прокси или нажмите «Очистить»:"
+        )
+        kb = K(row_width=1)
+        if SETTINGS.pwd_change_proxy:
+            kb.add(B("🗑 Очистить прокси", None, CBT.PROXY_CLR))
+        kb.add(B("⬅️ Назад", None, CBT.ACC_MENU))
+        answer(c)
+        msg = edit(c.message, text, kb)
+        msg_id = msg.message_id if msg and hasattr(msg, 'message_id') else c.message.message_id
+        _temp_storage.setdefault(c.from_user.id, {})["bot_msg_id"] = msg_id
+        tg.set_state(c.message.chat.id, msg_id, c.from_user.id, States.PROXY, {})
+
+    def proxy_clear(c):
+        SETTINGS.pwd_change_proxy = None
+        _save_settings()
+        answer(c, "✅ Прокси удалён")
+        open_acc_menu(c)
+
+    def _h_proxy(m):
+        val = (m.text or "").strip()
+        _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
+        if not val.startswith(("http://", "https://", "socks5://", "socks4://")):
+            send(m.chat.id, "❌ Неверный формат. Используйте http:// или socks5://",
+                 _back_kb(CBT.ACC_MENU))
+            return
+        SETTINGS.pwd_change_proxy = val
+        _save_settings()
+        send(m.chat.id, f"✅ Прокси сохранён: <code>{val}</code>", _back_kb(CBT.ACC_MENU))
 
     def open_notifs(c):
         kb = K(row_width=1)
@@ -3408,7 +4669,13 @@ def init(card: Cardinal):
                             ("notification_refund", "Возвраты")]:
             kb.add(B(f"{_is_on(getattr(SETTINGS, attr))} {label}", None, f"{CBT.TOGGLE}:{attr}"))
         kb.add(B("⬅️ Назад", None, CBT.MAIN))
-        edit(c.message, "<b>🔔 Уведомления</b>", kb)
+        text = (
+            "🔔 <b>Уведомления</b>\n\n"
+            f"∟ {_is_on(SETTINGS.notification_order_completed)} Выдача — при выдаче данных аккаунта\n"
+            f"∟ {_is_on(SETTINGS.notification_error)} Ошибки — при сбое смены пароля\n"
+            f"∟ {_is_on(SETTINGS.notification_refund)} Возвраты — при автоматическом возврате средств"
+        )
+        edit(c.message, text, kb)
 
     def open_msgs(c):
         kb = K(row_width=1)
@@ -3423,23 +4690,31 @@ def init(card: Cardinal):
         answer(c)
         cur = getattr(SETTINGS.messages, key, "")
         desc = MessagesConfig.DESCRIPTIONS.get(key, "")
+        vars_hint = MessagesConfig.VARIABLES.get(key, "")
+        vars_line = f"Переменные: <code>{vars_hint}</code>\n\n" if vars_hint else ""
         txt = (
             f"<b>{desc}</b>\n\n"
-            f"Текущий:\n<code>{cur}</code>\n\n"
-            f"Переменные: <code>$login $password $rent_period "
-            f"$code $end_time $hours $remaining $id $link $stock_list</code>\n\n"
+            f"Текущий:\n<code>{_html.escape(cur)}</code>\n\n"
+            f"{vars_line}"
             f"Введите новый текст:"
         )
         _ask(c.message.chat.id, c.from_user.id, States.MSG_EDIT, txt, _back_kb(CBT.MSGS))
 
     def _h_msg_edit(m):
         key = _temp_storage.get(m.from_user.id, {}).get("edit_key")
+        text = (m.text or "").strip()
         _cleanup_dialog(m.chat.id, m.from_user.id, m.message_id)
-        if key:
-            SETTINGS.set_message(key, m.text.strip())
-            send(m.chat.id, "✅ Сохранено!", _main_kb())
-        else:
+        if not key:
             send(m.chat.id, "❌ Данные утеряны, начните заново", _main_kb())
+            return
+        if not text or text.startswith("/"):
+            send(m.chat.id,
+                 "❌ Текст не сохранён: он пустой или похож на команду бота "
+                 "(начинается с «/»). Введите обычный текст сообщения.",
+                 _back_kb(CBT.MSGS))
+            return
+        SETTINGS.set_message(key, text)
+        send(m.chat.id, "✅ Сохранено!", _back_kb(CBT.MSGS))
 
     def open_stats(c):
         kb = K(row_width=1)
@@ -3463,7 +4738,7 @@ def init(card: Cardinal):
                 accs[label]["hrs"] += o.hours
             def fmt_top(dct):
                 top = sorted(dct.items(), key=lambda x: x[1]["hrs"], reverse=True)[:5]
-                return "\n".join(f"  ∟ {k}: {v['cnt']} | {v['hrs']:.0f}ч" for k, v in top) or "  ∟ Нет данных"
+                return "\n".join(f"  ∟ {k}: {v['cnt']} | {v['hrs']:.0f}ч" for k, v in top) or "  ∟ Аренд за этот период не было"
             cnt = len(arr)
             hrs = sum(o.hours for o in arr)
             return (f"— <b>{name}</b>\nВсего: {cnt} аренд | {hrs:.0f} ч\n"
@@ -3495,7 +4770,7 @@ def init(card: Cardinal):
             ext = " 🔄" if o.is_extension else ""
             acc_name = o.acc_login or f"#{o.acc_id}"
             kb.add(B(f"{icon} {o.buyer} | {acc_name} | {_period_label(int(o.hours))}{ext}",
-                     None, f"{CBT.HIST_DETAIL}:{o.id}"))
+                     None, f"{CBT.HIST_DETAIL}:{page}:{o.id}"))
         if pages > 1:
             nav = []
             if page > 1:
@@ -3508,17 +4783,11 @@ def init(card: Cardinal):
         edit(c.message, f"<b>📜 История ({total})</b>", kb)
 
     def open_history_detail(c):
+        parts = c.data.split(":")
+        page = parts[1] if len(parts) > 2 else "1"
         oid = _p(c)
         txt, o = _order_detail_text(oid)
-        edit(c.message, txt, _back_kb(f"{CBT.HIST}:1"))
-
-    def get_files_confirm(c):
-        kb = K(row_width=2)
-        kb.add(B("✅ Да, отправить", None, CBT.FILES_CONFIRM),
-               B("❌ Отмена", None, CBT.MAIN))
-        edit(c.message,
-             "⚠️ <b>Файлы содержат пароли и секреты Steam!</b>\n\nОтправить в чат?", kb)
-        answer(c)
+        edit(c.message, txt, _back_kb(f"{CBT.HIST}:{page}"))
 
     def get_files(c):
         answer(c)
@@ -3533,21 +4802,33 @@ def init(card: Cardinal):
     tg.cbq_handler(open_main, lambda c: c.data == CBT.MAIN or c.data.startswith(CBT.SP))
     tg.cbq_handler(open_acc_menu, lambda c: c.data == CBT.ACC_MENU)
     tg.cbq_handler(start_add, lambda c: c.data == CBT.ACC_ADD)
-    tg.cbq_handler(open_lots, lambda c: c.data == CBT.LOTS)
     tg.cbq_handler(lot_add, lambda c: c.data == CBT.LOT_ADD)
     tg.cbq_handler(lots_disable_all, lambda c: c.data == CBT.LOTS_DISABLE_ALL)
     tg.cbq_handler(lots_enable_all, lambda c: c.data == CBT.LOTS_ENABLE_ALL)
     tg.cbq_handler(open_reviews, lambda c: c.data == CBT.REVS)
     tg.cbq_handler(rev_add, lambda c: c.data == CBT.REV_ADD)
+    tg.cbq_handler(open_proxy, lambda c: c.data == CBT.PROXY)
+    tg.cbq_handler(proxy_clear, lambda c: c.data == CBT.PROXY_CLR)
     tg.cbq_handler(open_notifs, lambda c: c.data == CBT.NOTIFS)
     tg.cbq_handler(open_msgs, lambda c: c.data == CBT.MSGS)
     tg.cbq_handler(open_stats, lambda c: c.data == CBT.STATS)
     tg.cbq_handler(open_full_stats, lambda c: c.data == CBT.FULL_STATS)
     tg.cbq_handler(hrs_done, lambda c: c.data == CBT.HRS_DONE)
+    tg.cbq_handler(lot_hrs_custom, lambda c: c.data == CBT.LOT_HRS_CUSTOM)
+    tg.cbq_handler(lot_acc_done, lambda c: c.data == CBT.LOT_ACC_DONE)
+    tg.cbq_handler(acc_hrs_custom, lambda c: c.data == CBT.ACC_HRS_CUSTOM)
+    tg.cbq_handler(acc_manual_custom, lambda c: c.data == CBT.ACC_MANUAL_CUSTOM)
+    tg.cbq_handler(manual_confirm_yes, lambda c: c.data == CBT.ACC_MANUAL_YES)
+    tg.cbq_handler(rev_bon_custom, lambda c: c.data == CBT.REV_BON_CUSTOM)
+    tg.cbq_handler(rev_minstars, lambda c: c.data == CBT.REV_MINSTARS)
     for pfx, handler in [
         (CBT.ACC_LIST, open_acc_list), (CBT.ACC_DETAIL, open_acc_detail),
+        (CBT.LOTS, open_lots),
         (CBT.ACC_CODE, acc_code), (CBT.ACC_STOP, acc_stop),
+        (CBT.ACC_CODE_SEND, acc_code_send),
         (CBT.ACC_CHPWD, acc_chpwd), (CBT.ACC_EXTEND_DO, acc_extend_do),
+        (CBT.ACC_EXTEND_CUSTOM, acc_extend_custom),
+        (CBT.ACC_CHPWD_YES, acc_chpwd_yes), (CBT.ACC_CHPWD_NO, acc_chpwd_no),
         (CBT.ACC_RESET, acc_reset), (CBT.ACC_EDIT_HOURS, acc_edit_hours),
         (CBT.ACC_TOGGLE_HOUR, acc_toggle_hour), (CBT.ACC_SAVE_HOURS, acc_save_hours),
         (CBT.ACC_MANUAL, acc_manual_start), (CBT.ACC_MANUAL_HOURS, handle_manual_hours),
@@ -3555,17 +4836,21 @@ def init(card: Cardinal):
         (CBT.ACC_DEL_NO, acc_del_no),
         (CBT.LOT_DETAIL, open_lot_detail), (CBT.LOT_EDIT, lot_edit),
         (CBT.LOT_EDIT_TAG, lot_edit_tag), (CBT.LOT_EDIT_HRS, lot_edit_hrs),
+        (CBT.LOT_EDIT_ACC_DONE, lot_edit_acc_done),
         (CBT.LOT_RENAME, lot_rename),
         (CBT.LOT_DEL_CONFIRM, lot_del_confirm), (CBT.LOT_DEL_YES, lot_del_yes),
         (CBT.LOT_DEL_NO, lot_del_no),
         (CBT.LOT_TOGGLE_FP, lot_toggle_fp),
         (CBT.LOT_TAG, lot_tag), (CBT.LOT_HRS, lot_hours),
+        (CBT.LOT_EDIT_HRS_CUSTOM, lot_edit_hrs_custom),
         (CBT.REV_HRS, rev_hours), (CBT.REV_BON, rev_bonus),
-        (CBT.REV_DEL, rev_del), (CBT.MSG_EDIT, msg_edit),
+        (CBT.REV_DETAIL, rev_detail), (CBT.REV_EDIT, rev_edit),
+        (CBT.REV_MINSTARS_SET, rev_minstars_set),
+        (CBT.REV_DEL, rev_del), (CBT.REV_DEL_YES, rev_del_yes), (CBT.REV_DEL_NO, rev_del_no),
+        (CBT.MSG_EDIT, msg_edit),
         (CBT.TOGGLE, toggle_setting), (CBT.HIST, open_history),
         (CBT.HIST_DETAIL, open_history_detail),
-        (CBT.HRS_TGL, hrs_toggle), (CBT.FILES, get_files_confirm),
-        (CBT.FILES_CONFIRM, get_files),
+        (CBT.HRS_TGL, hrs_toggle), (CBT.FILES, get_files),
         (CBT.ACC_SET_PWD, acc_set_pwd),
         (CBT.ACC_EDIT_MAFILE, acc_edit_mafile),
     ]:
@@ -3573,10 +4858,16 @@ def init(card: Cardinal):
     tg.cbq_handler(acc_extend_menu,
                    lambda c: c.data.startswith(f"{CBT.ACC_EXTEND}:") and c.data.count(":") == 1)
     for state, handler in [
-        (States.LOGIN, _h_login), (States.PASS, _h_pass),
-        (States.TAG, _h_tag), (States.MAN_BUYER, _h_manual_buyer),
+        (States.LOGIN, _h_login), (States.PASS, _h_pass), (States.MAN_BUYER, _h_manual_buyer),
         (States.LOT_ID, _h_lot_id), (States.MSG_EDIT, _h_msg_edit),
         (States.SET_PWD, _h_set_pwd), (States.LOT_RENAME, _h_lot_rename),
+        (States.LOT_HRS_CUSTOM, _h_lot_hrs_custom),
+        (States.LOT_EDIT_HRS_CUSTOM, _h_lot_edit_hrs_custom),
+        (States.ACC_HRS_CUSTOM, _h_acc_hrs_custom),
+        (States.MAN_HRS_CUSTOM, _h_manual_hrs_custom),
+        (States.REV_BON_CUSTOM, _h_rev_bon_custom),
+        (States.ACC_EXTEND_CUSTOM, _h_acc_extend_custom),
+        (States.PROXY, _h_proxy),
     ]:
         tg.msg_handler(handler, func=lambda m, s=state: tg.check_state(m.chat.id, m.from_user.id, s))
     tg.msg_handler(_h_mafile, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, States.MAFILE))
@@ -3588,7 +4879,7 @@ def init(card: Cardinal):
         pass
     tg.msg_handler(open_main_cmd, commands=['auto_steam_rent'])
     card.add_telegram_commands(UUID, [
-        ("auto_steam_rent", "открыть настройки авто аренды аккаунтов", True),
+        ("auto_steam_rent", "открыть настройки авто стим аренды", True),
     ])
     threading.Thread(target=rental_check_loop, args=(card,), daemon=True).start()
 
